@@ -3275,6 +3275,11 @@ function readRecord(stored) {
 // seconds and letting them edit it — which is how two devices diverge in the first place. It
 // cannot hang: every request in supabase.js is bounded by its own timeout.
 async function init() {
+  // FIRST, and before any await. The invite link carries a live access token and a refresh token
+  // in the URL fragment; every millisecond it stays in the address bar is a millisecond it can
+  // reach browser history, a screenshot, or a paste into a chat asking why the link is broken.
+  readArrival();
+
   try {
     idb = await openDB();
   } catch (err) {
@@ -3302,6 +3307,14 @@ async function init() {
     setStatus('local-only', storageBlocked
       ? 'this browser is not saving anything — export before you close this tab'
       : 'this library lives in this browser only');
+  } else if (arrival && arrival.pending) {
+    // Someone followed an invite or a reset link. They are NOT signed out and must never be shown
+    // a password box for a password they have never had; the page asks them to choose one.
+    setStatus('arriving', arrival.kind === 'recovery'
+      ? 'choose a new password to finish'
+      : 'choose a password to finish setting up your account');
+  } else if (arrival && !arrival.ok) {
+    setStatus('signed-out', arrival.message);
   } else if (sb.hasSession()) {
     await claimForUser(sb.currentUser().id);
     await syncNow();
@@ -4005,6 +4018,33 @@ async function signUp(email, password) {
   return sb.signUp(email, password);
 }
 
+// An invite link puts the session in the URL fragment and expects the page to take it. Read
+// synchronously at boot so the tokens leave the address bar before anything can await, and
+// BEFORE init() decides whether this is a signed-out visit — otherwise a friend arriving on their
+// invite is shown a password box for a password they have never had.
+let arrival = null;
+function readArrival() {
+  arrival = sb.adoptFromUrl();
+  return arrival;
+}
+
+// Finish it: identify the token's owner, claim the local cache for them, then sync. Same order as
+// signIn, and for the same reason — nobody else's cached library may be shown to, or uploaded
+// for, the person who just arrived.
+async function acceptArrival() {
+  if (!arrival || !arrival.pending) return { ok: false, reason: 'link', message: 'no invite to accept' };
+  const res = await sb.finishFromUrl(arrival);
+  arrival = null;
+  if (!res.ok) return res;
+  await claimForUser(res.user.id);
+  const s = await syncNow();
+  return { ok: true, user: res.user, kind: res.kind, sync: syncState(), conflict: s.action === 'conflict' };
+}
+
+async function setPassword(pw) {
+  return sb.setPassword(pw);
+}
+
 async function signOut() {
   clearPushTimer();
   // Anything not yet uploaded is uploaded now, while the token still works. It would survive on
@@ -4028,6 +4068,7 @@ module.exports = {
 
   // Sync and accounts. Additive: nothing in lib/ knows these exist.
   signIn, signUp, signOut, currentUser,
+  readArrival, acceptArrival, setPassword,
   syncNow, syncState,
   setSyncHandler: (fn) => { onSync = fn; },
   // Fired when ANOTHER tab replaced the library under this one. The page holds its own rendered
@@ -4387,9 +4428,104 @@ async function writeLibrary(db) {
   return { ok: true };
 }
 
+// --- arriving from an email link -------------------------------------------------------------
+//
+// THE INVITE FLOW WAS COMPLETELY BROKEN AND THIS IS WHY IT MATTERS MORE THAN IT LOOKS.
+//
+// An invited person never types a password, because they do not have one. Supabase mails them a
+// link, they land on the site with the session already granted in the URL FRAGMENT, and the page
+// is supposed to pick it up and ask them to choose a password. Nothing here read the fragment and
+// nothing could set a password, so an invitee landed on a signed-out page showing a password box
+// for a password that did not exist. Every friend would have hit that, and only that: it is the
+// one and only route into this app, since public sign-up is off.
+//
+// Found on 2026-08-01 by the owner inviting himself, which is the first time anybody walked the
+// path a friend actually walks.
+//
+// The fragment is used and then REMOVED before anything is awaited. It carries a live access
+// token and a refresh token; left in the address bar it goes into browser history, into a
+// screenshot, into whatever the person pastes when they ask for help.
+function adoptFromUrl(loc, hist) {
+  const location_ = loc || (typeof location !== 'undefined' ? location : null);
+  const history_ = hist || (typeof history !== 'undefined' ? history : null);
+  if (!location_ || !location_.hash || location_.hash.length < 2) return null;
+
+  const p = new URLSearchParams(location_.hash.slice(1));
+  const kind = p.get('type');
+  const access = p.get('access_token');
+  const err = p.get('error_code') || p.get('error');
+
+  if (!access && !err) return null;   // some other fragment; leave it alone
+
+  const clear = () => {
+    try {
+      if (history_ && history_.replaceState) {
+        history_.replaceState(null, '', location_.pathname + (location_.search || ''));
+      } else { location_.hash = ''; }
+    } catch { /* an unwritable history is not a reason to refuse the sign-in */ }
+  };
+  clear();
+
+  if (err) {
+    // An invite is good for one hour. "otp_expired" reaching a person as a blank page is how they
+    // conclude the site is broken rather than that the link went stale.
+    const detail = p.get('error_description') || err;
+    return {
+      pending: false,
+      ok: false,
+      reason: /expired|otp/i.test(detail) ? 'expired' : 'link',
+      message: /expired|otp/i.test(detail)
+        ? 'that invite link has expired — they only last an hour. Ask for another one.'
+        : `that link did not work: ${String(detail).replace(/\+/g, ' ')}`,
+    };
+  }
+
+  return {
+    pending: true,
+    kind: kind || 'session',
+    // Deliberately NOT saved yet. finishFromUrl does that, after asking Supabase who the token
+    // belongs to, so a session is never stored without a user attached to it.
+    tokens: {
+      access_token: access,
+      refresh_token: p.get('refresh_token') || null,
+      expires_at: p.get('expires_at') ? Number(p.get('expires_at')) * 1000
+        : Date.now() + (Number(p.get('expires_in') || 3600) * 1000),
+    },
+  };
+}
+
+// The fragment carries tokens but no user, so ask who this is before storing anything.
+async function finishFromUrl(adopted) {
+  if (!adopted || !adopted.pending) return { ok: false, reason: 'link', message: 'nothing to finish' };
+  const res = await call('/auth/v1/user', {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${adopted.tokens.access_token}` },
+  });
+  if (!res.ok) return res;
+  if (!res.data || !res.data.id) {
+    return { ok: false, reason: 'http', message: 'the server did not say who that link belongs to' };
+  }
+  saveSession({ ...adopted.tokens, user: { id: res.data.id, email: res.data.email } });
+  return { ok: true, user: session.user, kind: adopted.kind };
+}
+
+// Choose a password. Used by an invitee, who has never had one, and by anyone resetting.
+async function setPassword(password) {
+  const pw = String(password || '');
+  // Supabase's own default minimum. Checked here so the person is told before a round trip.
+  if (pw.length < 6) return { ok: false, reason: 'weak', message: 'that password is too short — use at least 6 characters' };
+  const res = await call('/auth/v1/user', { method: 'PUT', auth: true, body: { password: pw } });
+  if (!res.ok) {
+    if (res.status === 422) return { ok: false, reason: 'weak', message: messageOf(res.data, 'the server refused that password') };
+    return res;
+  }
+  return { ok: true };
+}
+
 module.exports = {
   signIn, signUp, signOut, currentUser, hasSession, refresh,
   readLibrary, writeLibrary,
+  adoptFromUrl, finishFromUrl, setPassword,
   REQUEST_TIMEOUT_MS, REFRESH_SKEW_MS,
 };
 };

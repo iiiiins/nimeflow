@@ -191,6 +191,17 @@
           <button class="ghost" id="signUpBtn" title="only goes through if public sign-ups are on — it will say so if they are not">I was told to make my own</button>
         </div>
       </div>
+      <!-- Someone who followed an invite. They have an account and no password, so this replaces
+           the sign-in box rather than sitting beside it. Without this panel an invited friend
+           lands on a password field for a password that has never existed, which is the only
+           route into this app and was the only one nobody had walked. -->
+      <div id="acctArrive" hidden>
+        <p class="sub" id="acctArriveWhy">You were invited. Choose a password and you are in.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input type="password" id="acctNewPw" placeholder="choose a password" autocomplete="off" style="width:220px" aria-label="choose a password">
+          <button class="go" id="setPwBtn">Set it and continue</button>
+        </div>
+      </div>
       <div id="acctIn" hidden>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
           <span>Signed in as <b id="acctEmail"></b></span>
@@ -586,7 +597,11 @@ async function refresh() {
   // Landing an empty library on a queue that says "nothing waiting" is the whole problem, so
   // a first-time user is put where the work actually starts. Only on a truly empty library:
   // once anything exists, the chosen tab is the user's business.
-  if (STATE.onboarding && STATE.onboarding.stage === 'empty' && !renderFirstRun.landed) {
+  // Except for somebody who just followed an invite. Their library IS empty, so this would fire
+  // and drop them on Add, away from the one thing they have to do before the account is usable.
+  // wireStore already put them on Data; this ran straight after it and took it back.
+  const arriving = STORE && STORE.syncState().state === 'arriving';
+  if (!arriving && STATE.onboarding && STATE.onboarding.stage === 'empty' && !renderFirstRun.landed) {
     renderFirstRun.landed = true;
     document.querySelector('nav button[data-tab=add]').click();
   }
@@ -1283,10 +1298,48 @@ function signInTrouble(res) {
 function renderAccount() {
   const configured = serverConfigured();
   const user = STORE.currentUser();
+  // An arrival outranks both other states: they are not signed out, and they are not usably
+  // signed in until they have a password they can come back with.
+  const arriving = configured && STORE.syncState().state === 'arriving';
   $('#acctLocal').hidden = configured;
-  $('#acctOut').hidden = !configured || !!user;
-  $('#acctIn').hidden = !configured || !user;
+  $('#acctArrive').hidden = !arriving;
+  $('#acctOut').hidden = !configured || !!user || arriving;
+  $('#acctIn').hidden = !configured || !user || arriving;
   if (user) $('#acctEmail').textContent = user.email || 'this account';
+  if (arriving) {
+    $('#acctArriveWhy').textContent = STORE.syncState().message
+      || 'Choose a password and you are in.';
+  }
+}
+
+// Accept the invite, then set the password. In that order: the token from the link is what
+// authorises the password change, so it has to become this browser's session first.
+async function doSetPassword() {
+  const box = $('#acctNewPw');
+  const pw = box.value;
+  if (!pw) { acctSay('Choose a password first.', true); return; }
+  const btn = $('#setPwBtn');
+  btn.disabled = true;
+  acctSay('setting up your account…');
+  try {
+    const accepted = await STORE.acceptArrival();
+    if (!accepted.ok) { acctSay(signInMessage(accepted), true); return; }
+    const set = await STORE.setPassword(pw);
+    if (!set.ok) {
+      // They ARE signed in at this point, so this is not a dead end: say what happened and let
+      // them use the app, rather than implying the invite failed.
+      acctSay(`${set.message} You are signed in, so you can set one later from this tab.`, true);
+      return;
+    }
+    box.value = '';
+    acctSay('Done. That password works from any device now.');
+  } catch (err) {
+    acctSay(err.message || 'that did not work', true);
+  } finally {
+    btn.disabled = false;
+    box.value = '';
+    await redrawAfter('Your account is ready', '#acctNote');
+  }
 }
 
 async function doSignIn() {
@@ -1528,6 +1581,9 @@ if (!STORE) {
 } else {
   $('#syncPill').onclick = () => showTab('data');
   $('#signInBtn').onclick = doSignIn;
+  $('#setPwBtn').onclick = doSetPassword;
+  // Enter is what a person actually presses in a one-field form.
+  $('#acctNewPw').onkeydown = (e) => { if (e.key === 'Enter') doSetPassword(); };
   $('#signUpBtn').onclick = doSignUp;
   $('#acctPw').onkeydown = (ev) => { if (ev.key === 'Enter') doSignIn(); };
   $('#signOutBtn').onclick = async () => {
@@ -1582,6 +1638,17 @@ function wireStore() {
   // init() has already run and its status change fired into nobody. Read where things stand rather
   // than sitting on "opening" until the next event.
   renderSync(STORE.syncState());
+
+  // Somebody who followed an invite has an empty library, so refresh() would put them on Add —
+  // and the panel asking them to choose a password lives on Data, where they would never look.
+  // The first screen a friend ever sees has to be the one thing they must do.
+  if (STORE.syncState().state === 'arriving') {
+    showTab('data');
+    const box = $('#acctArrive');
+    if (box) box.scrollIntoView({ block: 'center' });
+    const pw = $('#acctNewPw');
+    if (pw) pw.focus();
+  }
 }
 
 // The hosted build opens its library before the first call: store.load() is synchronous and

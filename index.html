@@ -1,0 +1,1595 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NimeFlow</title>
+<style>
+  :root{
+    --bg:#0e0f13; --panel:#16181f; --panel2:#1c1f28; --line:#272b36;
+    --ink:#e6e8ee; --dim:#8b91a3; --faint:#5b6072;
+    --accent:#7c9cff; --good:#4ec9a5; --warn:#e0a458; --bad:#e0605e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 ui-sans-serif,system-ui,"Segoe UI",sans-serif}
+  header{display:flex;align-items:baseline;gap:18px;padding:14px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:10;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);font-weight:600}
+  nav{display:flex;gap:4px}
+  nav button{background:none;border:1px solid transparent;color:var(--dim);padding:5px 12px;border-radius:6px;cursor:pointer;font:inherit}
+  nav button:hover{color:var(--ink);background:var(--panel)}
+  nav button.on{color:var(--ink);background:var(--panel2);border-color:var(--line)}
+  .stat{margin-left:auto;color:var(--faint);font-size:12px;font-variant-numeric:tabular-nums}
+  main{padding:20px;max-width:1180px}
+  section{display:none} section.on{display:block}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);margin:0 0 4px;font-weight:600}
+  .sub{color:var(--faint);font-size:12.5px;margin:0 0 16px;max-width:70ch}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:10px}
+  .row{display:flex;gap:12px;align-items:flex-start}
+  img.cov{width:46px;height:64px;object-fit:cover;border-radius:4px;background:var(--panel2);flex:none}
+  img.cov.lg{width:78px;height:110px}
+  .t{font-weight:600;line-height:1.3}
+  .meta{color:var(--faint);font-size:12px;margin-top:2px}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);color:var(--dim);margin:2px 4px 0 0;white-space:nowrap}
+  .tag.good{color:var(--good);border-color:#25493f} .tag.warn{color:var(--warn);border-color:#4a3a22}
+  .tag.bad{color:var(--bad);border-color:#4a2626} .tag.acc{color:var(--accent);border-color:#2e3a63}
+  textarea{width:100%;min-height:190px;background:var(--panel);border:1px solid var(--line);color:var(--ink);border-radius:10px;padding:12px;font:13px/1.6 ui-monospace,Consolas,monospace;resize:vertical}
+  button.go{background:var(--accent);color:#0b0d14;border:0;border-radius:8px;padding:9px 18px;font:600 14px/1 inherit;cursor:pointer}
+  button.go:disabled{opacity:.45;cursor:default}
+  button.ghost{background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:6px 12px;cursor:pointer;font:inherit}
+  select,input[type=number],input[type=text],input[type=email],input[type=password]{background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font:inherit}
+  input[type=number]{width:80px}
+  input[type=file]{color:var(--dim);font:inherit;max-width:100%}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);font-weight:600;padding:6px 8px;border-bottom:1px solid var(--line)}
+  td{padding:7px 8px;border-bottom:1px solid #1e2129;vertical-align:middle}
+  tr:hover td{background:#14161d}
+  .muted{color:var(--faint)}
+  .empty{color:var(--faint);padding:26px;text-align:center;border:1px dashed var(--line);border-radius:10px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:10px}
+  .why{font-size:11.5px;color:var(--faint);margin-top:6px;line-height:1.45}
+  .bar{height:3px;background:var(--panel2);border-radius:2px;overflow:hidden;margin-top:6px}
+  .bar>i{display:block;height:100%;background:var(--accent)}
+  .flag{font-size:12px;color:var(--warn);margin-top:5px}
+  .err{color:var(--bad);padding:10px 0}
+  label.chk{display:flex;gap:8px;align-items:center;color:var(--dim);font-size:13px;cursor:pointer;margin-bottom:6px}
+  #firstrun:empty{display:none}
+  .fr{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:16px 18px;margin-bottom:20px}
+  .fr h3{margin:0 0 4px;font-size:15px}
+  .fr .steps{display:flex;flex-direction:column;gap:10px;margin-top:12px}
+  .fr .step{display:flex;gap:10px;align-items:baseline}
+  .fr .dot{width:18px;flex:0 0 18px;text-align:center;color:var(--faint)}
+  .fr .step.now .dot{color:var(--ink)}
+  .fr .step.done .dot{color:var(--good)}
+  .fr .step .what{color:var(--dim)}
+  .fr .step.now .what{color:var(--ink)}
+  .fr .step .count{color:var(--faint);font-size:12px;margin-left:6px}
+  .fr .go{margin-top:14px}
+  /* .pill sets a display, which would beat the browser's own [hidden] rule and show a pill that
+     was meant to be off. Author styles win over the user-agent sheet, so hiding needs one too. */
+  [hidden]{display:none!important}
+  .pill{display:inline-flex;align-items:center;gap:7px;background:var(--panel2);border:1px solid var(--line);color:var(--dim);border-radius:99px;padding:3px 11px;font:12px/1.6 inherit;cursor:pointer}
+  .pill::before{content:"";width:7px;height:7px;border-radius:99px;background:currentColor;flex:none}
+  .pill.good{color:var(--good);border-color:#25493f} .pill.warn{color:var(--warn);border-color:#4a3a22}
+  .pill.bad{color:var(--bad);border-color:#4a2626} .pill.acc{color:var(--accent);border-color:#2e3a63}
+  #alerts{padding:0 20px;max-width:1180px}
+  .alert{border:1px solid var(--line);border-left-width:3px;background:var(--panel);border-radius:8px;padding:12px 14px;margin-top:14px;max-width:80ch;font-size:13px;line-height:1.55}
+  .alert.bad{border-left-color:var(--bad)} .alert.warn{border-left-color:var(--warn)}
+  .alert b{display:block;margin-bottom:3px}
+  .alert .acts{display:flex;gap:8px;margin-top:11px;flex-wrap:wrap;align-items:center}
+  .alert table{margin:10px 0 2px;max-width:420px}
+</style>
+</head>
+<body>
+<header>
+  <h1>NimeFlow</h1>
+  <nav>
+    <button data-tab="now" class="on">Now</button>
+    <button data-tab="add">Add</button>
+    <button data-tab="rank">Rank</button>
+    <button data-tab="library">Library</button>
+    <button data-tab="discover">Discover</button>
+    <button data-tab="data">Data</button>
+  </nav>
+  <div class="stat" id="stat"></div>
+  <!-- Always on screen in the hosted build, because "is my library actually saved anywhere" is
+       not a question anyone should have to open a tab to answer. Removed on the desktop, which
+       has no sync to report. -->
+  <button class="pill" id="syncPill" hidden></button>
+</header>
+
+<div id="alerts">
+  <div class="alert bad" id="persistAlert" hidden></div>
+  <div class="alert bad" id="conflictAlert" hidden></div>
+  <div class="alert" id="exportAlert" hidden></div>
+</div>
+
+<div id="firstrun"></div>
+
+<main>
+  <section id="now" class="on">
+    <h2>What you're owed</h2>
+    <p class="sub">Only things with something to do. Bump an episode, say you're caught up, pin what you're watching next, or wave a sequel off for good — every button clears the card, which is what keeps this a queue and not a second library. Sequels that were only <em>announced</em> show up too, which is the case every other tracker misses.</p>
+    <div style="margin-bottom:14px;display:flex;gap:10px;align-items:center">
+      <button class="ghost" id="syncBtn">Check for new chapters</button>
+      <button class="ghost" id="adaptBtn">Check for adaptations</button>
+      <span class="muted" id="syncNote"></span>
+    </div>
+    <div id="owedList"></div>
+  </section>
+
+  <section id="add">
+    <h2>Add — paste a list</h2>
+    <p class="sub">Type it the way you'd say it, one per line. "blue lock both seasons completed", "one piece - up to ep 1050 - dropped it", "the greatest estate developer (webtoon)". It parses status, episode counts and medium, then asks you to confirm anything it had to guess. Nothing is saved until you press commit.</p>
+    <textarea id="dump" placeholder="one title per line…"></textarea>
+    <div style="margin:10px 0 20px;display:flex;gap:10px;align-items:center">
+      <button class="go" id="parseBtn">Look these up</button>
+      <span class="muted" id="parseNote"></span>
+    </div>
+    <div id="parseOut"></div>
+  </section>
+
+  <section id="rank">
+    <h2>Rank — which did you like more?</h2>
+    <p class="sub">Press <b>1</b> or <b>2</b> to pick, <b>3</b> for a tie, <b>backspace</b> to undo. Nothing to type. It asks the pairs whose answers it can't already predict, so each one teaches it something — comparing your favourite against something you dropped would teach nothing. Scores are replayed from your answers, never stored, so an undo genuinely corrects the ranking.</p>
+    <label class="chk" style="margin-bottom:12px"><input type="checkbox" id="fFranchise" checked> Rank whole franchises, not seasons <span class="muted">— Solo Leveling's manhwa, anime and season 2 count as one thing</span></label>
+    <div id="pairBox"></div>
+    <div style="margin-top:26px"><h2>Standing</h2><div id="board"></div></div>
+    <div style="margin-top:26px">
+      <h2>What it can't explain</h2>
+      <p class="sub">The recommender scores every title on a handful of dials — does the story punish its lead, does the lead drive the outcome, is there a visible progression system. This downloads which of them predict <em>you</em>, and the titles they get most wrong. Those are the ones no dial covers yet, and they are what a new dial gets written from. It contains title names and numbers, nothing else about your library.</p>
+      <button class="ghost" id="fitBtn">Download fit report</button>
+      <span class="muted" id="fitNote"></span>
+    </div>
+  </section>
+
+  <section id="library">
+    <h2>Library</h2>
+    <p class="sub">Caught up means you've seen everything released, not that the work is finished — so new seasons resurface in Now. Change status or progress inline; it saves immediately. Movies, specials and OVAs get a <em>verdict</em> instead of a score, because they can't fairly be compared against a full run — that verdict is yours to keep and is weighted zero in the taste model, so a franchise isn't counted twice.</p>
+    <div style="margin-bottom:10px"><input type="text" id="filterBox" placeholder="filter…" style="width:260px"></div>
+    <table><thead><tr><th></th><th>Title</th><th>Status</th><th>Progress</th><th>Score</th><th title="Rated on childhood, not on what you'd start today. Keeps the rating, stops it anchoring a recommendation shelf.">Nostalgia</th><th>Medium</th><th>Release</th></tr></thead>
+    <tbody id="libBody"></tbody></table>
+  </section>
+
+  <section id="discover">
+    <h2>Discover</h2>
+    <p class="sub"><b>For you</b> is the standing list — everything ranked against your whole profile at once, so a title several of your favourites point at beats one that a single favourite points at hard. <b>More like…</b> is the per-title view. Neither ranks by community score. <span id="crowdFit"></span> Nostalgia-marked titles are excluded from the profile entirely.</p>
+    <div class="card">
+      <label class="chk"><input type="checkbox" id="fAge" checked> Hide static child casts handed adult material <span class="muted">— young casts doing age-appropriate things still show</span></label>
+      <label class="chk"><input type="checkbox" id="fCn" checked> Flag Chinese-origin titles <span class="muted">— shown, not hidden, since a good dub makes them fine and no API knows about dubs</span></label>
+      <label class="chk"><input type="checkbox" id="fShowBlocked"> Show what the filters removed</label>
+      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="go" id="forYouBtn">For you</button>
+        <span class="muted">ranked against your whole profile</span>
+        <span style="flex:1"></span>
+        <select id="dMedium"><option value="ANIME">Anime</option><option value="MANGA">Manga / manhwa</option></select>
+        <button class="ghost" id="discoverBtn">More like… (per title)</button>
+      </div>
+      <div class="muted" id="discNote" style="margin-top:8px"></div>
+    </div>
+    <div id="forYouOut"></div>
+    <div class="grid" id="discOut"></div>
+  </section>
+
+  <!-- Hosted build only. Removed outright on the desktop, where there is no account to hold, no
+       server to sync with, and no route behind any of these buttons — export, import and the
+       snapshot list are functions on the browser store, and server.js serves none of them. -->
+  <section id="data">
+    <h2>Account and your data</h2>
+    <p class="sub" id="dataWhere"></p>
+
+    <div class="card">
+      <h2>Account</h2>
+      <div id="acctLocal" hidden>
+        <p class="sub">This copy has no server behind it, so there is no account to sign in to and nothing leaves this browser. Everything below still works, and the file it exports opens in any other copy.</p>
+      </div>
+      <div id="acctOut" hidden>
+        <p class="sub">Signing in makes your phone and your laptop one library instead of two. Accounts are invite-only: ask whoever sent you this link to invite your email address, and you will get a message asking you to set a password.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input type="email" id="acctEmailIn" placeholder="email" autocomplete="off" style="width:230px">
+          <input type="password" id="acctPw" placeholder="password" autocomplete="off" style="width:180px">
+          <button class="go" id="signInBtn">Sign in</button>
+          <button class="ghost" id="signUpBtn" title="only goes through if public sign-ups are on — it will say so if they are not">I was told to make my own</button>
+        </div>
+      </div>
+      <div id="acctIn" hidden>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <span>Signed in as <b id="acctEmail"></b></span>
+          <button class="ghost" id="syncNowBtn">Sync now</button>
+          <button class="ghost" id="signOutBtn">Sign out</button>
+        </div>
+      </div>
+      <div class="muted" id="acctNote" style="margin-top:9px"></div>
+      <div class="muted" id="syncLine" style="margin-top:4px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Export</h2>
+      <p class="sub">Writes the whole library to a file you keep: titles, progress, scores and every ranking answer. It is the copy that survives a cleared browser, a paused server and a lost account, and it opens in any other copy of NimeFlow, hosted or desktop.</p>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="go" id="exportBtn">Export a copy</button>
+        <span class="muted" id="exportNote"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Import</h2>
+      <p class="sub">Replaces this library with an exported file. Nothing is merged — two libraries have no rule for whose progress wins — so this says exactly what goes and what arrives before it touches anything. What is here now is snapshotted first and lands in Backups below.</p>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <input type="file" id="importFile" accept="application/json,.json">
+        <span class="muted" id="importNote"></span>
+      </div>
+      <div id="importConfirm"></div>
+    </div>
+
+    <div class="card">
+      <h2>Backups</h2>
+      <p class="sub">Snapshots this app takes for itself: before it overwrites the library, before an import, and whenever a sync finds two copies that both changed. Restoring one is itself undoable — what you have now becomes the newest snapshot in the list, so you can go straight back.</p>
+      <div id="backupList"></div>
+      <div class="muted" id="backupNote" style="margin-top:9px"></div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+<script>
+const $ = (s) => document.querySelector(s);
+const el = (t, c, x) => { const n = document.createElement(t); if (c) n.className = c; if (x != null) n.textContent = x; return n; };
+const esc = (s) => String(s == null ? '' : s);
+
+let STATE = null;
+
+// ONE PAGE, TWO BUILDS. The hosted build loads app.js first, which puts the same route handlers
+// on window.NimeFlow and runs them here — there is no server on GitHub Pages to fetch from. The
+// desktop build has server.js behind fetch() and ships no app.js, so this reads null and nothing
+// below it changes.
+const BUNDLE = typeof NimeFlow === 'object' ? NimeFlow : null;
+
+async function api(path, opts) {
+  if (BUNDLE) return BUNDLE.api(path, opts);
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({ error: 'bad response' }));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === b.dataset.tab));
+});
+const showTab = (name) => { const b = $(`nav button[data-tab=${name}]`); if (b) b.click(); };
+
+// The storage layer the hosted build has and the desktop one does not: accounts, sync, export,
+// import and the snapshot list are all functions on web-src/store-web.js, reached through the same
+// bundle the route handlers came in on. The desktop keeps its library in a folder and server.js
+// serves no route for any of this, so here it is null and the Data tab is removed further down.
+const STORE = BUNDLE ? BUNDLE.store : null;
+
+const STATUSES = ['CAUGHT_UP','COMPLETED','WATCHING','PAUSED','DROPPED','PLANNED'];
+const KIND_LABEL = {
+  NEXT_UP:['good','watch next'],
+  ADAPTATION_ANIME:['good','you read it — anime exists'],
+  ADAPTATION_MANGA:['acc','you watched it — colour source'],
+  BEHIND:['bad','behind'], SEQUEL_AIRING:['good','sequel airing'], SEQUEL_READY:['acc','sequel ready'],
+  SEQUEL_ANNOUNCED:['warn','sequel announced'], ONGOING:['acc','ongoing'], RESUME:['warn','resume']
+};
+
+function renderStat() {
+  const c = STATE.counts || {};
+  $('#stat').textContent = `${STATE.total} entries · ${c.CAUGHT_UP||0} caught up · ${c.DROPPED||0} dropped · profile ${STATE.profile.confidence}`;
+}
+
+async function queueAction(body) {
+  const r = await api('/api/queue-action', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  STATE = r.state; renderAll();
+  // An action that cannot do the obvious thing has to SAY so. "Caught up" on a title with no
+  // chapter count used to write 0 over 0 and report success, leaving the card sitting there.
+  if (r.message) {
+    const note = $('#syncNote');
+    if (note) { note.textContent = r.message; note.style.color = 'var(--warn)';
+      setTimeout(() => { note.style.color = ''; }, 12000); }
+  }
+}
+
+function renderOwed() {
+  const box = $('#owedList'); box.innerHTML = '';
+  // "Everything you follow is finished" is only true of somebody who follows something. It was
+  // the first sentence the tool said to a new user, on the tab it opens on, and it was false.
+  // tools/stranger-states.js then found the second case: a library that is all watchlist
+  // follows six things and is level with none of them.
+  if (!STATE.owed.length) {
+    const c = STATE.counts || {};
+    const following = (c.CAUGHT_UP || 0) + (c.WATCHING || 0) + (c.PAUSED || 0) + (c.COMPLETED || 0);
+    box.append(el('div', 'empty',
+      STATE.total === 0
+        ? 'Nothing here yet. This queue fills itself from what you add — it only ever shows things with something to do.'
+        : following === 0
+          ? 'Nothing in progress. Everything here is planned or dropped, so there is nothing to be behind on yet.'
+          : 'Nothing waiting. Everything you follow is either finished or you are level with it.'));
+    return;
+  }
+
+  for (const o of STATE.owed) {
+    const card = el('div','card'); const row = el('div','row');
+    if (o.cover) { const i = el('img','cov'); i.src = o.cover; i.loading='lazy'; row.append(i); }
+    const mid = el('div'); mid.style.flex='1';
+    mid.append(el('div','t', o.title));
+    const [cls,label] = KIND_LABEL[o.kind] || ['','?'];
+    mid.append(el('span','tag '+cls, label));
+    // One-offs are visibly marked and always sort below real seasons, so a 24-minute special
+    // never reads as a new season waiting for you.
+    if (o.oneOff) mid.append(el('span','tag', (o.format || 'one-off').toLowerCase() + ' · side item'));
+    mid.append(el('div','meta', o.detail));
+
+    // Inline actions. Every one of these removes the card from the queue — that is the rule
+    // that stops Now becoming a second library.
+    const acts = el('div');
+    acts.style.cssText = 'display:flex;gap:7px;margin-top:9px;flex-wrap:wrap;align-items:center';
+    const btn = (label, fn, title) => { const b = el('button','ghost',label); b.style.padding='4px 10px'; if (title) b.title = title; b.onclick = fn; return b; };
+
+    if (o.kind === 'SEQUEL_AIRING' || o.kind === 'SEQUEL_READY' || o.kind === 'SEQUEL_ANNOUNCED'
+        || o.kind === 'ADAPTATION_ANIME' || o.kind === 'ADAPTATION_MANGA') {
+      // "Already seen it" has to be here. Without it the only ways to accept a sequel both
+      // mean HAVEN'T WATCHED — which is how Kengan Ashura Part II sat as PLANNED after he had
+      // watched it, and a planned entry cannot join its franchise for ranking.
+      acts.append(btn('Already seen it', () => queueAction({ action:'addTitle', sequelId:o.sequelId, value:'CAUGHT_UP' }), 'adds it as history, so it joins its franchise and can be ranked'));
+      acts.append(btn('Add to library', () => queueAction({ action:'addSequel', sequelId:o.sequelId })));
+      acts.append(btn('Watch next', () => queueAction({ action:'addSequel', sequelId:o.sequelId, value:true }), 'adds it and pins it to the top'));
+      acts.append(btn('Not interested', () => queueAction({ action:'dismissSequel', sequelId:o.sequelId }), 'never suggest this one again'));
+    } else {
+      const unit = o.unitType === 'chapters' ? 'ch' : 'ep';
+      acts.append(btn('+1 ' + unit, () => queueAction({ action:'bump', entryId:o.entryId, value:1 })));
+
+      const num = el('input'); num.type='number'; num.min='0'; num.value = o.progress ?? 0;
+      num.style.width='72px';
+      num.title = o.untrackable ? 'no count exists for this one — your number is the only one there is' : '';
+      num.onchange = () => queueAction({ action:'setProgress', entryId:o.entryId, value:Number(num.value) });
+      acts.append(num);
+      acts.append(el('span','muted', o.available != null ? `of ${o.available} out` : (o.total ? `of ${o.total}` : (o.untrackable ? 'of ? — unknown' : ''))));
+
+      // Different label when there is nothing to be level WITH, so the button never promises
+      // a comparison the data cannot support.
+      acts.append(o.untrackable
+        ? btn("I'm current", () => queueAction({ action:'caughtUp', entryId:o.entryId }), 'no count exists — this just records that you are up to date and stops asking')
+        : btn('Caught up', () => queueAction({ action:'caughtUp', entryId:o.entryId }), 'level with everything released — clears it from here'));
+      acts.append(btn(o.kind === 'NEXT_UP' ? 'Unpin' : 'Watch next',
+        () => queueAction({ action: o.kind === 'NEXT_UP' ? 'unpin' : 'pin', entryId:o.entryId }),
+        'pin to the top of this queue'));
+      acts.append(btn('Drop', () => queueAction({ action:'drop', entryId:o.entryId }), 'stop following it'));
+    }
+    mid.append(acts);
+
+    row.append(mid); card.append(row); box.append(card);
+  }
+}
+
+function renderLibrary() {
+  const q = $('#filterBox').value.toLowerCase();
+  const body = $('#libBody'); body.innerHTML = '';
+  // Every other view got an empty state; this one showed bare column headers and no next step,
+  // both on a new library and whenever the filter box matches nothing.
+  const rows = STATE.entries.filter((e) => !q || e.title.toLowerCase().includes(q));
+  if (!rows.length) {
+    const tr = el('tr'); const td = el('td');
+    td.colSpan = 12;
+    td.append(el('div','empty', STATE.total === 0
+      ? 'Nothing here yet. Add what you have watched or read on the Add tab.'
+      : 'No title matches that filter.'));
+    tr.append(td); body.append(tr);
+    return;
+  }
+  for (const e of rows) {
+    const tr = el('tr');
+    const tdC = el('td'); if (e.cover){ const i=el('img','cov'); i.src=e.cover; i.style.width='30px'; i.style.height='42px'; i.loading='lazy'; tdC.append(i);} tr.append(tdC);
+    const tdT = el('td'); tdT.append(el('div','t', e.title));
+    tdT.append(el('div','meta', [e.year, e.country, e.averageScore ? 'AniList ' + e.averageScore : null].filter(Boolean).join(' · ')));
+    tr.append(tdT);
+
+    const sel = el('select');
+    STATUSES.forEach(s => { const o = el('option', null, s.replace('_',' ').toLowerCase()); o.value = s; if (s===e.status) o.selected = true; sel.append(o); });
+    sel.onchange = () => patch(e.id, { status: sel.value });
+    const tdS = el('td'); tdS.append(sel); tr.append(tdS);
+
+    const num = el('input'); num.type='number'; num.min='0'; num.value = e.progress.units;
+    num.onchange = () => patch(e.id, { progress: Number(num.value) });
+    const tdP = el('td'); tdP.append(num);
+    tdP.append(el('span','muted', ' / ' + (e.totalUnits ?? '?') + ' ' + e.progress.unitType.slice(0,3)));
+    tr.append(tdP);
+
+    const tdSc = el('td');
+    if (e.standalone) {
+      // One-offs get a verdict, not a score. They never enter a pairwise pair, so a number
+      // here would be one he had to invent rather than one the comparisons produced.
+      const VERDICTS = [['WORTH_IT','worth it'],['FINE','fine'],['SKIP','skip it']];
+      const wrap = el('div'); wrap.style.cssText='display:flex;gap:4px';
+      for (const [v, label] of VERDICTS) {
+        const b = el('button','ghost',label);
+        b.style.cssText = 'padding:3px 8px;font-size:12px';
+        if (e.verdict === v) { b.style.borderColor='var(--accent)'; b.style.color='var(--accent)'; }
+        b.onclick = () => queueAction({ action:'verdict', entryId:e.id, value: e.verdict === v ? null : v });
+        wrap.append(b);
+      }
+      tdSc.append(wrap);
+    } else {
+      const sc = el('input'); sc.type='number'; sc.min='0'; sc.max='100'; sc.placeholder='—'; sc.value = e.score ?? '';
+      sc.onchange = () => patch(e.id, { score: sc.value === '' ? null : Number(sc.value) });
+      tdSc.append(sc);
+    }
+    tr.append(tdSc);
+
+    const nos = el('input'); nos.type = 'checkbox'; nos.checked = !!e.nostalgia;
+    nos.title = 'rated on childhood — keep the score, stop it anchoring a shelf';
+    nos.onchange = () => patch(e.id, { nostalgia: nos.checked });
+    const tdN = el('td'); tdN.append(nos); tr.append(tdN);
+
+    tr.append(el('td', 'muted', e.medium.toLowerCase()));
+    tr.append(el('td', 'muted', (e.releaseStatus||'').toLowerCase().replace(/_/g,' ')));
+    body.append(tr);
+  }
+}
+
+async function patch(id, changes) {
+  try { await api('/api/entry', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id, changes }) }); await refresh(); }
+  catch (e) { alert('save failed: ' + e.message); }
+}
+
+$('#fitBtn').onclick = async () => {
+  const note = $('#fitNote');
+  note.textContent = 'computing…';
+  try {
+    const r = await api('/api/fit-report');
+    const top = r.dials.filter((d) => d.r !== null && Math.abs(d.r) >= 0.2);
+    // Say what is in the file before it lands in their downloads folder, so sending it on is
+    // an informed act rather than a blind one.
+    note.textContent = top.length
+      ? `${r.scoredUnits} ranked titles · strongest dial ${top[0].id} at r=${top[0].r} · ${r.worstMisses.length} unexplained titles`
+      : `${r.scoredUnits} ranked titles · no dial predicts you yet · ${r.worstMisses.length} unexplained titles`;
+    const blob = new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `nimeflow-fit-report-${r.generatedAt.slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) { note.textContent = 'failed: ' + e.message; }
+};
+
+// Every path that changes STATE goes through here.
+//
+// Added after the first-run panel shipped stale: committing three titles updated the header
+// count and left the panel reading "0 added", because four separate call sites each listed
+// the views they happened to know about. A view added later is invisible to all of them.
+function renderAll() { renderStat(); renderSettings(); renderFirstRun(); renderCrowdFit(); renderOwed(); renderLibrary(); renderData(); }
+
+// The three setting checkboxes are `checked` in the HTML and were never read back from the
+// stored settings. So unchecking a filter saved false, a reload drew it checked again, and the
+// next action that POSTs settings — For you, More like, the franchise toggle — wrote true
+// straight back over the choice. A setting that silently undoes itself is worse than one that
+// cannot be changed, and this bit the existing user, not only a new one.
+function renderSettings() {
+  const s = STATE.settings || {};
+  const f = s.filters || {};
+  const set = (id, v) => { const n = $(id); if (n) n.checked = !!v; };
+  set('#fAge', f.childCastCredibility);
+  set('#fCn', f.requireNonChineseAudio);
+  set('#fFranchise', s.rankByFranchise);
+}
+
+async function saveFilters(patch) {
+  const cur = (STATE.settings && STATE.settings.filters) || {};
+  const r = await api('/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filters: { ...cur, ...patch } }),
+  });
+  if (r && r.settings) STATE.settings = r.settings;
+  renderAll();
+}
+
+// This line used to assert a fact about one person — "the three highest-rated anime in your
+// library are the three you dropped hardest" — to whoever happened to be looking. True of
+// the first user, false of a new user with an empty library, and unknowable for anyone else. So it is
+// measured on the reader's own ranking instead, and says nothing until there is enough to say
+// it from. A user whose taste IS the canon will see a positive number, which is the honest
+// outcome and not a failure of the tool.
+function renderCrowdFit() {
+  const n = $('#crowdFit'); if (!n) return;
+  const f = STATE.crowdFit;
+  // undefined means the page is newer than the server, which happens on every reload between
+  // an edit and a restart. Say nothing rather than telling a user with 43 ranked titles that
+  // they have not ranked anything. null means the server looked and there is not enough yet.
+  if (f === undefined) { n.textContent = ''; return; }
+  if (!f) { n.textContent = 'Once you have ranked a few, this will say how community score lines up with your own ratings.'; return; }
+  const strength = Math.abs(f.r) < 0.1 ? 'has almost no relationship to' : Math.abs(f.r) < 0.3 ? (f.r < 0 ? 'points slightly against' : 'lines up slightly with') : (f.r < 0 ? 'points AGAINST' : 'lines up with');
+  n.textContent = `Across your ${f.n} ranked titles, community score ${strength} your own ratings (r = ${f.r}).`;
+}
+
+// The first-run guide.
+//
+// A new library is not a broken one, but every tab read as though it were: Now told somebody
+// who follows nothing that everything they follow is finished, and Discover returned an empty
+// list without saying what would fill it. This panel is the only thing standing between a new
+// user and closing the tab, so it carries the REAL gates from the server rather than
+// encouragement, and it disappears the moment the last one is passed.
+function renderFirstRun() {
+  const box = $('#firstrun'); box.textContent = '';
+  const o = STATE.onboarding;
+  if (!o || o.stage === 'ready') return;
+
+  const card = el('div', 'fr');
+  card.append(el('h3', null, 'Getting started'));
+  card.append(el('p', 'sub', 'This is a queue and a recommender, so it needs two things from you before it can do either: what you have already watched or read, and roughly how you rate it. ' + storageSentence()));
+
+  const steps = el('div', 'steps');
+  const step = (state, label, detail, count) => {
+    const row = el('div', 'step ' + state);
+    row.append(el('div', 'dot', state === 'done' ? '✓' : state === 'now' ? '▸' : '·'));
+    const body = el('div');
+    const head = el('div', 'what', label);
+    if (count) head.append(el('span', 'count', count));
+    body.append(head);
+    body.append(el('div', 'sub', detail));
+    row.append(body);
+    return row;
+  };
+
+  const addedDone = o.rankable >= o.gates.pair;
+  steps.append(step(
+    addedDone ? 'done' : 'now',
+    'Add what you have watched and read',
+    'Paste it in the Add tab the way you would say it out loud. Two titles is enough to start ranking; the more history it has, the better everything downstream gets.',
+    `${o.added} added`));
+
+  steps.append(step(
+    !addedDone ? 'todo' : o.ranked >= o.gates.shelves ? 'done' : 'now',
+    'Rank a few pairs',
+    `Which of these two did you like more. Recommendations turn on at ${o.gates.shelves} ranked titles, and the ranking stops moving around ${o.settlesAround} answers.`,
+    `${o.comparisons} answered · ${o.ranked} titles ranked`));
+
+  steps.append(step(
+    o.ranked >= o.gates.shelves ? 'done' : 'todo',
+    'Discover',
+    'Built from your own favourites rather than from what is popular. It stays empty until step two, because with nothing ranked it has nothing to aim at.',
+    null));
+
+  card.append(steps);
+
+  // The two exclusions, asked rather than inherited. They default OFF for a new library
+  // because a filtered title is never shown, so a wrong filter is invisible: the user cannot
+  // discover it hid something they would have liked. Asking costs one line each.
+  const f = (STATE.settings && STATE.settings.filters) || {};
+  const asks = el('div', 'asks');
+  asks.append(el('div', 'sub', 'Two things you can rule out now or later, from the Discover tab. Both are off until you say otherwise.'));
+  const ask = (id, checked, label, note) => {
+    const l = el('label', 'chk');
+    const cb = el('input'); cb.type = 'checkbox'; cb.checked = !!checked;
+    cb.onchange = () => saveFilters({ [id]: cb.checked });
+    l.append(cb, document.createTextNode(' ' + label));
+    l.append(el('span', 'muted', ' — ' + note));
+    return l;
+  };
+  asks.append(ask('childCastCredibility', f.childCastCredibility,
+    'Hide child casts handed adult material',
+    'kids in world-saving stakes, or sexualised. Young casts doing age-appropriate things still show'));
+  asks.append(ask('requireNonChineseAudio', f.requireNonChineseAudio,
+    'Flag Chinese-origin titles',
+    'flagged rather than hidden, since a good dub makes them fine and no API knows about dubs'));
+  card.append(asks);
+
+  const go = el('button', 'go');
+  go.textContent = o.stage === 'empty' || !addedDone ? 'Add my history' : 'Start ranking';
+  go.onclick = () => document.querySelector(`nav button[data-tab=${(o.stage === 'empty' || !addedDone) ? 'add' : 'rank'}]`).click();
+  card.append(go);
+  box.append(card);
+}
+
+async function refresh() {
+  STATE = await api('/api/state');
+  renderAll();
+  // Landing an empty library on a queue that says "nothing waiting" is the whole problem, so
+  // a first-time user is put where the work actually starts. Only on a truly empty library:
+  // once anything exists, the chosen tab is the user's business.
+  if (STATE.onboarding && STATE.onboarding.stage === 'empty' && !renderFirstRun.landed) {
+    renderFirstRun.landed = true;
+    document.querySelector('nav button[data-tab=add]').click();
+  }
+}
+
+$('#adaptBtn').onclick = async () => {
+  const b = $('#adaptBtn'); b.disabled = true; $('#syncNote').textContent = 'looking for adaptations both ways…';
+  try {
+    const r = await api('/api/sync-adaptations', { method: 'POST' });
+    STATE = r.state; renderAll();
+    // The reverse direction is filtered hard on purpose — say how hard, so a small number
+    // reads as "we checked and they were black and white", not as "nothing found".
+    $('#syncNote').textContent =
+      `${r.toWatch} you read → anime · ${r.toRead} you watched → colour source ` +
+      `(of ${r.reverseChecked} sources checked; black-and-white ones are skipped by your rule)`;
+  } catch (e) { $('#syncNote').textContent = 'failed: ' + e.message; }
+  b.disabled = false;
+};
+
+$('#syncBtn').onclick = async () => {
+  const b = $('#syncBtn'); b.disabled = true; $('#syncNote').textContent = 'asking MangaDex (throttled — it bans IPs for hammering)…';
+  try {
+    const r = await api('/api/sync-chapters', { method: 'POST' });
+    STATE = r.state; renderAll();
+    // Say plainly which numbers can't be trusted rather than presenting them all as fact.
+    const bad = r.report.filter(x => x.confidence && (x.confidence.level === 'stale' || x.confidence.level === 'weak'));
+    // Failures used to be counted as successes: a sync with MangaDex down said "checked 12 ·
+    // all numbers from series records" having fetched nothing, and the queue kept showing the
+    // last sync's numbers as if they were current.
+    const failed = r.failed || 0;
+    $('#syncNote').textContent =
+      (failed ? `${failed} could not be checked (${r.failures.map(x => x.title.slice(0,20)).join(', ')}) · ` : '') +
+      `checked ${r.synced}` +
+      (bad.length ? ` · ${bad.length} unreliable: ${bad.map(x => x.title.slice(0,22)).join(', ')}`
+        : r.synced ? ' · all numbers from series records' : '');
+    $('#syncNote').style.color = failed ? 'var(--warn)' : '';
+  } catch (e) { $('#syncNote').textContent = 'failed: ' + e.message; }
+  b.disabled = false;
+};
+
+// --- add flow ---------------------------------------------------------------
+
+let PARSED = [];
+
+$('#parseBtn').onclick = async () => {
+  const text = $('#dump').value.trim();
+  if (!text) return;
+  $('#parseBtn').disabled = true; $('#parseNote').textContent = 'searching AniList (throttled to stay under the rate limit)…';
+  try {
+    const r = await api('/api/parse', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text }) });
+    PARSED = r.items; renderParsed();
+    $('#parseNote').textContent = `${r.items.length} lines`;
+  } catch (e) { $('#parseOut').innerHTML=''; $('#parseOut').append(el('div','err','failed: ' + e.message)); $('#parseNote').textContent=''; }
+  $('#parseBtn').disabled = false;
+};
+
+function renderParsed() {
+  const box = $('#parseOut'); box.innerHTML = '';
+  if (!PARSED.length) return;
+
+  PARSED.forEach((item, idx) => {
+    const card = el('div','card');
+    const row = el('div','row');
+
+    const pick = el('div'); pick.style.flex='1';
+    pick.append(el('div','meta', item.raw));
+
+    if (!item.candidates.length) {
+      pick.append(el('div','flag','no match on AniList — skipped'));
+      item.chosen = null;
+    } else {
+      const sel = el('select'); sel.style.marginTop='6px'; sel.style.maxWidth='100%';
+      item.candidates.forEach((c, i) => {
+        const o = el('option', null, `${c.title} — ${c.format||'?'} ${c.year||''} ${c.country}${c.alreadyHave?'  (already in library)':''}`);
+        o.value = i; if (i === item.chosen) o.selected = true; sel.append(o);
+      });
+      sel.onchange = () => { item.chosen = Number(sel.value); renderParsed(); };
+      pick.append(sel);
+
+      const c = item.candidates[item.chosen ?? 0];
+      if (c && c.cover) { const i = el('img','cov'); i.src=c.cover; i.loading='lazy'; row.append(i); }
+
+      const controls = el('div'); controls.style.cssText='display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center';
+      const st = el('select');
+      STATUSES.forEach(s => { const o=el('option',null,s.replace('_',' ').toLowerCase()); o.value=s; if (s===item.guess.status) o.selected=true; st.append(o); });
+      st.onchange = () => { item.guess.status = st.value; };
+      controls.append(st);
+
+      const pr = el('input'); pr.type='number'; pr.min='0'; pr.placeholder='progress';
+      pr.value = item.guess.episodes ?? ''; pr.onchange = () => { item.guess.episodes = pr.value===''?null:Number(pr.value); };
+      controls.append(pr);
+      controls.append(el('span','muted', c ? (c.totalUnits ? 'of ' + c.totalUnits : '') : ''));
+      pick.append(controls);
+    }
+
+    for (const u of item.uncertain) pick.append(el('div','flag','⚠ ' + u));
+    // A fallback match came from searching a shortened version of the line, which is how
+    // "frieren beyond journeys end" gets found despite the missing apostrophe — and also how a
+    // line that matches nothing at all still gets plausible-looking candidates. Say which.
+    if (item.viaShortened) {
+      pick.append(el('div','flag','⚠ nothing matched the whole line, so this was found by searching just the first words — check it is the right one'));
+    }
+
+    row.append(pick); card.append(row); box.append(card);
+  });
+
+  const bar = el('div'); bar.style.cssText='margin:14px 0 40px;display:flex;gap:12px;align-items:center';
+  const commit = el('button','go','Commit ' + PARSED.filter(p=>p.candidates.length).length + ' entries');
+  commit.onclick = async () => {
+    commit.disabled = true; commit.textContent = 'saving…';
+    const items = PARSED.filter(p => p.candidates.length && p.chosen != null).map(p => {
+      const c = p.candidates[p.chosen];
+      return { anilistId: c.anilistId, medium: c.medium, status: p.guess.status, progress: p.guess.episodes || 0, notes: p.notes, raw: p.raw };
+    });
+    try {
+      const r = await api('/api/commit', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ items }) });
+      STATE = r.state; renderAll();
+      // Anything that did not match is put BACK in the box instead of vanishing with it.
+      //
+      // Committing used to clear the textarea and the results together, so a 40-line paste
+      // where 6 titles failed left "added 34" and no record of which six — and the original
+      // text was gone too, so the only way to find out was retyping the list. The lines that
+      // failed are exactly the ones a person needs to fix and try again.
+      const unmatched = PARSED.filter((p) => !p.candidates.length).map((p) => p.raw);
+      const shortfall = items.length - r.added;
+      $('#dump').value = unmatched.join('\n');
+      $('#parseOut').innerHTML=''; PARSED=[];
+      $('#parseNote').textContent = `added ${r.added}` +
+        (unmatched.length ? ` · ${unmatched.length} left in the box: nothing matched them, try a different spelling` : '') +
+        (shortfall > 0 && !unmatched.length ? ` · ${shortfall} could not be fetched and were skipped` : '');
+      $('#parseNote').style.color = (unmatched.length || shortfall > 0) ? 'var(--warn)' : '';
+    } catch (e) { commit.disabled=false; commit.textContent='Commit'; alert('commit failed: ' + e.message); }
+  };
+  bar.append(commit);
+  bar.append(el('span','muted','nothing is written until you press this'));
+  box.append(bar);
+}
+
+$('#filterBox').oninput = renderLibrary;
+
+// --- rank -------------------------------------------------------------------
+
+let PAIR = null;
+
+async function loadPair() {
+  const r = await api('/api/pair');
+  if (r.done) { PAIR = null; renderPair({ done: true }); renderBoard(r.leaderboard || []); return; }
+  PAIR = r; renderPair(r); loadBoard();
+}
+
+async function loadBoard() {
+  try { const r = await api('/api/leaderboard'); renderBoard(r.leaderboard); } catch (e) {}
+}
+
+function renderPair(p) {
+  const box = $('#pairBox'); box.innerHTML = '';
+  if (p.done) {
+    // "Every useful pair has been asked" was shown to a user who had asked none of them, one
+    // line above "No comparisons yet" in the Standing box — two contradictory sentences and no
+    // action on either. A library with fewer than two rankable titles has not finished; it has
+    // not started. PLANNED and one-offs are not rankable, so a pasted watchlist lands here too.
+    const o = (STATE && STATE.onboarding) || {};
+    box.append(el('div', 'empty', o.rankable >= 2
+      ? 'Every useful pair has been asked. Add more history and it will have new questions.'
+      : o.added === 0
+        ? 'Nothing to compare yet. Add what you have already watched or read on the Add tab, and this fills up.'
+        : 'Nothing to compare yet. Ranking needs at least two titles you have actually watched or read — things marked planned, and films and specials, do not take part.'));
+    return;
+  }
+  const wrap = el('div'); wrap.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:14px';
+
+  [['a',1],['b',2]].forEach(([k, num]) => {
+    const it = p[k];
+    const card = el('div','card');
+    card.style.cssText += 'cursor:pointer;text-align:center;padding:18px;transition:border-color .12s';
+    card.onmouseenter = () => card.style.borderColor = 'var(--accent)';
+    card.onmouseleave = () => card.style.borderColor = 'var(--line)';
+    card.onclick = () => choose(it.id);
+    if (it.cover) { const i = el('img'); i.src = it.cover; i.style.cssText='width:120px;height:170px;object-fit:cover;border-radius:6px'; i.loading='lazy'; card.append(i); }
+    card.append(el('div','t', it.title));
+    card.append(el('div','meta', [it.year, it.medium.toLowerCase(), it.comparisons + ' seen'].filter(Boolean).join(' · ')));
+    // Say what the franchise contains, so a pair is never ambiguous about scope.
+    if (it.parts > 1) card.append(el('div','why', it.parts + ' parts — ' + it.partTitles.join(' · ')));
+    const kbd = el('div','tag acc','press ' + num);
+    kbd.style.marginTop = '8px';
+    card.append(kbd);
+    wrap.append(card);
+  });
+  box.append(wrap);
+
+  const bar = el('div'); bar.style.cssText='display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap';
+  const tie = el('button','ghost','About the same  (3)'); tie.onclick = () => choose(null);
+  const undo = el('button','ghost','Undo  (backspace)'); undo.onclick = undoCompare;
+  bar.append(tie, undo);
+  bar.append(el('span','muted', `${p.totalComparisons} comparisons · around ${p.suggestedTotal} gives a stable order over ${p.rankableCount} titles`));
+  box.append(bar);
+}
+
+async function choose(winnerId) {
+  if (!PAIR) return;
+  const { a, b } = PAIR;
+  PAIR = null;                              // guard against double input during the request
+  try {
+    const r = await api('/api/compare', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ a: a.id, b: b.id, winner: winnerId }) });
+    if (r.done || !r.next) { renderPair({ done: true }); loadBoard(); }
+    else { PAIR = r.next; renderPair(r.next); loadBoard(); }
+    refresh();
+  } catch (e) { alert('could not record: ' + e.message); loadPair(); }
+}
+
+async function undoCompare() {
+  try { const r = await api('/api/undo-compare', { method:'POST' }); PAIR = r.next; if (r.next) renderPair(r.next); loadBoard(); refresh(); }
+  catch (e) { /* nothing to undo */ }
+}
+
+function renderBoard(list) {
+  const box = $('#board'); box.innerHTML = '';
+  if (!list || !list.length) { box.append(el('div','empty','No comparisons yet. Answer a few and your ranking builds itself.')); return; }
+  const t = el('table');
+  t.innerHTML = '<thead><tr><th>#</th><th></th><th>Title</th><th>Your score</th><th>Community</th><th>Seen</th></tr></thead>';
+  const tb = el('tbody');
+  list.forEach((r, i) => {
+    const tr = el('tr');
+    tr.append(el('td','muted', String(i+1)));
+    const tdC = el('td'); if (r.cover){const im=el('img'); im.src=r.cover; im.style.cssText='width:26px;height:36px;object-fit:cover;border-radius:3px'; im.loading='lazy'; tdC.append(im);} tr.append(tdC);
+    const tdT = el('td'); tdT.append(el('div','t', r.title));
+    tdT.append(el('div','meta', r.medium.toLowerCase() + ' · ' + r.status.replace('_',' ').toLowerCase()));
+    tr.append(tdT);
+    tr.append(el('td', null, r.score == null ? '—' : String(r.score)));
+    // Community score shown alongside deliberately: it is the number that measures backwards
+    // for him, and seeing the two diverge is the point.
+    tr.append(el('td','muted', r.communityScore == null ? '—' : String(r.communityScore)));
+    tr.append(el('td','muted', String(r.comparisons)));
+    tb.append(tr);
+  });
+  t.append(tb); box.append(t);
+}
+
+document.addEventListener('keydown', (ev) => {
+  if (!$('#rank').classList.contains('on')) return;
+  if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA') return;
+  if (ev.key === '1' && PAIR) { ev.preventDefault(); choose(PAIR.a.id); }
+  else if (ev.key === '2' && PAIR) { ev.preventDefault(); choose(PAIR.b.id); }
+  else if (ev.key === '3' && PAIR) { ev.preventDefault(); choose(null); }
+  else if (ev.key === 'Backspace') { ev.preventDefault(); undoCompare(); }
+});
+
+document.querySelector('nav button[data-tab=rank]').addEventListener('click', () => loadPair().catch(()=>{}));
+
+$('#fFranchise').onchange = async () => {
+  // Reversible on purpose. Comparisons are stored between entry ids and re-interpreted at
+  // replay time, so flipping this re-reads the same log a different way — no migration, no
+  // data loss in either direction.
+  await api('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ rankByFranchise: $('#fFranchise').checked }) });
+  await loadPair(); await refresh();
+};
+
+// --- discover ---------------------------------------------------------------
+
+$('#forYouBtn').onclick = async () => {
+  const btn = $('#forYouBtn'); btn.disabled = true; $('#discNote').textContent = 'ranking against your whole profile…';
+  $('#discOut').innerHTML = '';
+  try {
+    await api('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ filters: { childCastCredibility: $('#fAge').checked, requireNonChineseAudio: $('#fCn').checked } }) });
+    const r = await api('/api/foryou?anime=15&manga=5');
+    renderForYou(r);
+    // The server answers `{anime:[],manga:[],note:...}` when nothing is ranked yet — no
+    // anchors key, no stats key. Reading them threw, and the user saw the raw text "failed:
+    // Cannot read properties of undefined (reading 'length')" where the list should be. The
+    // note the server sent to explain the situation was never displayed anywhere.
+    if (r.note && !r.anime.length && !r.manga.length) {
+      $('#discNote').textContent = r.note;
+      $('#forYouOut').append(el('div','empty','Rank a few pairs first — this list is built from your own favourites, so it has nothing to aim at yet.'));
+    } else {
+      const st = r.stats || {};
+      $('#discNote').textContent =
+        `${r.anime.length} anime · ${r.manga.length} manga · from ${(r.anchors||[]).length} of your favourites` +
+        (st.ageFiltered !== undefined ? ` · ${st.ageFiltered} age-filtered, ${st.sameFranchise} same-franchise` : '') +
+        ((r.excludedNostalgia||[]).length ? ` · nostalgia excluded from the profile: ${r.excludedNostalgia.join(', ')}` : '');
+    }
+  } catch (e) { $('#forYouOut').innerHTML=''; $('#forYouOut').append(el('div','err','failed: ' + e.message)); $('#discNote').textContent=''; }
+  btn.disabled = false;
+};
+
+function renderForYou(r) {
+  const box = $('#forYouOut'); box.innerHTML = '';
+
+  const section = (title, list, note) => {
+    if (!list.length) return;
+    const h = el('div'); h.style.margin = '22px 0 8px';
+    h.append(el('h2', null, title));
+    if (note) h.append(el('div','meta', note));
+    box.append(h);
+    const grid = el('div','grid');
+    for (const c of list) grid.append(forYouCard(c));
+    box.append(grid);
+  };
+
+  section('For you — anime', r.anime, 'ranked by how many of your favourites point at each one, not by community score');
+  section('For you — manga & manhwa', r.manga, null);
+
+  fillChapterCounts(r.manga);
+
+  // A deeper list is worth having on demand: the manga side surfaced several things the first user had
+  // already started reading and forgotten the titles of, so depth here recovers real history.
+  const more = el('button','ghost', `Show 30 manga instead of ${r.manga.length}`);
+  more.style.marginTop = '14px';
+  more.onclick = async () => {
+    more.disabled = true; more.textContent = 'loading…';
+    try { renderForYou(await api('/api/foryou?anime=15&manga=30')); }
+    catch (e) { more.disabled = false; more.textContent = 'failed — retry'; }
+  };
+  // Offering "show 30 instead of 0" on an empty list is noise; there is nothing to deepen yet.
+  if (r.manga.length && r.manga.length < 30) box.append(more);
+}
+
+// AniList publishes a chapter count for FINISHED manga and never for ongoing ones — measured
+// across twelve popular Korean titles, 7/7 finished had one and 0/5 releasing did. Ongoing
+// Korean progression fantasy is most of what he reads, so the manga side would otherwise
+// answer "how long is this" with "not published" for nearly every pick.
+//
+// Runs AFTER the cards are on screen and patches them in place: it is one throttled MangaDex
+// request per title, so blocking the page on it would cost eight seconds for a list of thirty.
+async function fillChapterCounts(list) {
+  const want = (list || []).filter((c) => !c.extent || /not published/.test(c.extent));
+  if (!want.length) return;
+  try {
+    const r = await api('/api/chapter-counts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ titles: want.map((c) => ({ key: String(c.anilistId), title: c.title })) }),
+    });
+    for (const c of want) {
+      const hit = r.counts[String(c.anilistId)];
+      const node = document.querySelector(`[data-extent-for="${c.anilistId}"]`);
+      if (!hit || !hit.chapters || !node) continue;
+      const ongoing = hit.status && hit.status !== 'completed';
+      node.textContent = [node.dataset.base, `${hit.chapters} chapters${ongoing ? ' so far, still releasing' : ''}`]
+        .filter(Boolean).join(' · ');
+    }
+  } catch { /* the counts are a nicety; the list is the feature */ }
+}
+
+function forYouCard(c) {
+  const card = el('div','card'); const row = el('div','row');
+  if (c.cover) { const i = el('img','cov lg'); i.src = c.cover; i.loading='lazy'; row.append(i); }
+  const mid = el('div'); mid.style.flex='1'; mid.style.minWidth='0';
+
+  mid.append(el('div','t', c.title));
+  // Community score is deliberately NOT here any more. It is measured slightly backwards for
+  // him (r = -0.163), so giving it the headline slot was showing the one number that misleads.
+  const metaLine = el('div','meta', [c.year, c.format, c.country, c.extent].filter(Boolean).join(' · '));
+  metaLine.dataset.extentFor = c.anilistId;
+  metaLine.dataset.base = [c.year, c.format, c.country].filter(Boolean).join(' · ');
+  mid.append(metaLine);
+
+  // The bar draws the SAME number the list is sorted by. Previously it drew corroboration
+  // while the sort used vote count, so the order looked arbitrary — which it was, to anyone
+  // reading the bar.
+  const matchLine = el('div');
+  matchLine.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:6px';
+  const bar = el('div','bar'); bar.style.flex = '1';
+  const fill = el('i');
+  fill.style.width = Math.max(4, Math.min(100, c.match ?? 0)) + '%';
+  bar.append(fill);
+  const pct = el('span','t', (c.match ?? 0) + '% match');
+  pct.style.cssText = 'font-size:12.5px;white-space:nowrap;color:var(--accent)';
+  matchLine.append(bar, pct);
+  mid.append(matchLine);
+  if (c.parts) {
+    mid.append(el('div','why',
+      // "crowd" and "community" were two different quantities wearing the same word, which is
+      // why a card could read "66% crowd · community rates it 68" and mean nothing by it. The
+      // first is how many people linked this title to a favourite of yours; the second is
+      // AniList's average rating of it. Both are named for what they are now.
+      `${c.parts.corroboration}% agreement across your favourites · ${c.parts.progression}% progression language · ${c.parts.votes}% link volume (${c.votes} people linked it)` +
+      (c.averageScore != null ? ` · AniList users rate it ${c.averageScore}` : '')));
+  }
+
+  const marks = el('div'); marks.style.marginTop='6px';
+  marks.append(el('span','tag good', c.anchors === 1 ? '1 favourite points here' : `${c.anchors} favourites point here`));
+  if (c.progression >= 3) marks.append(el('span','tag good','strong progression language'));
+  else if (c.hasSystem) marks.append(el('span','tag','progression system'));
+  if (c.isOverpowered) marks.append(el('span','tag good','overpowered lead'));
+  if (c.needsJudgement) marks.append(el('span','tag warn','young cast — worth a look first'));
+  if (c.audioFlag) marks.append(el('span','tag warn','Chinese-origin, needs a dub'));
+  mid.append(marks);
+
+  if (c.because.length) mid.append(el('div','why', 'because you rate: ' + c.because.join(', ')));
+
+  // One click to turn recognition into data. the first user had already started reading several of the
+  // manga this list surfaced and had forgotten the titles — that history was missing from the
+  // library and was never going to arrive by him typing it out.
+  const acts = el('div');
+  acts.style.cssText = 'display:flex;gap:7px;margin-top:9px;flex-wrap:wrap';
+  const act = (label, body, title) => {
+    const b = el('button','ghost',label); b.style.padding='4px 10px'; if (title) b.title = title;
+    b.onclick = async () => {
+      b.disabled = true; b.textContent = '…';
+      try { await api('/api/queue-action', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+            card.style.opacity = '0.35'; b.textContent = label + ' ✓'; await refresh(); }
+      catch (e) { b.disabled = false; b.textContent = label; alert('failed: ' + e.message); }
+    };
+    return b;
+  };
+  acts.append(act('Already read this', { action:'addTitle', sequelId:c.anilistId, value:'CAUGHT_UP' }, 'you have read or watched it — adds it as history, which improves the profile'));
+  acts.append(act('Reading now', { action:'addTitle', sequelId:c.anilistId, value:'WATCHING' }));
+  acts.append(act('Want to try', { action:'addTitle', sequelId:c.anilistId, value:'PLANNED' }));
+  acts.append(act('Not interested', { action:'dismissSequel', sequelId:c.anilistId }, 'never suggest this again'));
+  mid.append(acts);
+
+  row.append(mid); card.append(row);
+  return card;
+}
+
+$('#discoverBtn').onclick = async () => {
+  const btn = $('#discoverBtn'); btn.disabled = true; $('#discNote').textContent = 'ranking…';
+  try {
+    await api('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ filters: { childCastCredibility: $('#fAge').checked, requireNonChineseAudio: $('#fCn').checked } }) });
+    const q = new URLSearchParams({ medium: $('#dMedium').value, showBlocked: $('#fShowBlocked').checked ? '1':'0' });
+    const r = await api('/api/discover?' + q);
+    $('#forYouOut').innerHTML = '';
+    renderDiscover(r);
+    // The early return for an unranked library carries only `results` and `note`, so the three
+    // counts below printed "undefined age-filtered · undefined same-franchise · undefined".
+    if (r.note && !(r.shelves || []).length && !(r.results || []).length) {
+      $('#discNote').textContent = r.note;
+    } else {
+      const shown = r.shelves && r.shelves.length
+        ? `${r.shelves.length} shelves · ${r.shelves.reduce((n, s) => n + s.results.length, 0)} picks`
+        : `${(r.results || []).length} shown`;
+      const bits = [shown];
+      if (r.blockedCount !== undefined) bits.push(`${r.blockedCount} age-filtered`);
+      if (r.franchiseFiltered !== undefined) bits.push(`${r.franchiseFiltered} same-franchise`);
+      if (r.method) bits.push(r.method);
+      $('#discNote').textContent = bits.join(' · ');
+    }
+  } catch (e) { $('#discOut').innerHTML=''; $('#discOut').append(el('div','err','failed: ' + e.message)); $('#discNote').textContent=''; }
+  btn.disabled = false;
+};
+
+function renderDiscover(r) {
+  const box = $('#discOut'); box.innerHTML = '';
+  box.style.display = 'block';
+
+  if (r.shelves && r.shelves.length) {
+    for (const shelf of r.shelves) {
+      const head = el('div');
+      head.style.cssText = 'display:flex;align-items:center;gap:10px;margin:22px 0 8px';
+      if (shelf.anchor.cover) { const i = el('img'); i.src = shelf.anchor.cover; i.style.cssText='width:30px;height:42px;object-fit:cover;border-radius:3px'; i.loading='lazy'; head.append(i); }
+      const ht = el('div');
+      ht.append(el('h2', null, 'More like ' + shelf.anchor.title));
+      ht.append(el('div','meta','you rated it ' + (shelf.anchor.score ?? '—')));
+      head.append(ht);
+      box.append(head);
+
+      const grid = el('div','grid');
+      const max = Math.max(...shelf.results.map(x => Math.abs(x.fit)), 0.001);
+      for (const c of shelf.results) grid.append(discCard(c, max));
+      box.append(grid);
+    }
+    return;
+  }
+
+  if (!r.results.length) { box.append(el('div','empty','Nothing came back. Add more history — the profile is only as good as what it has seen.')); return; }
+  const grid = el('div','grid');
+  const max = Math.max(...r.results.map(x => Math.abs(x.fit)), 0.001);
+  for (const c of r.results) grid.append(discCard(c, max));
+  box.append(grid);
+}
+
+function discCard(c, max) {
+    const card = el('div','card'); const row = el('div','row');
+    if (c.cover) { const i = el('img','cov lg'); i.src=c.cover; i.loading='lazy'; row.append(i); }
+    const mid = el('div'); mid.style.flex='1'; mid.style.minWidth='0';
+    mid.append(el('div','t', c.title));
+    mid.append(el('div','meta', [c.year, c.format, c.country, 'AniList ' + (c.averageScore ?? '–')].filter(Boolean).join(' · ')));
+    // How much of it there is. A "+" means AniList's relation edges reach one hop only, so the
+    // figure is a floor rather than a total.
+    if (c.extent) mid.append(el('div','meta', c.extent));
+
+    // The bar shows how many people linked this to the anchor, which is the sort key.
+    // My own fit score is reported as text, not as the visual — it was measured getting his
+    // real picks wrong, so it should not look like the headline number.
+    if (c.votes) {
+      const bar = el('div','bar'); const fill = el('i');
+      fill.style.width = Math.max(3, Math.min(100, Math.log2(c.votes + 1) * 12)) + '%';
+      bar.append(fill); mid.append(bar);
+      mid.append(el('div','meta', c.votes + ' readers linked this to ' + (c.anchors === 1 ? 'it' : c.anchors + ' of your favourites')));
+    }
+
+    const marks = [];
+    if (c.isOverpowered) marks.push('overpowered lead');
+    // Graded, not binary. The one recommendation the first user has watched to the end scored 4.4 on
+    // this measure — #1 across his whole library, above Solo Leveling — while the tag-based
+    // fit gave it 0.046. A boolean would have hidden the only signal that called it.
+    if (typeof c.progression === 'number' && c.progression >= 3) marks.push('strong progression language');
+    else if (c.hasSystem) marks.push('progression system');
+    if (typeof c.competence === 'number') marks.push(c.competence >= 0 ? 'lead is rewarded' : 'lead gets put through it');
+    if (typeof c.agency === 'number' && c.agency < -0.3) marks.push('lead may be carried');
+    if (typeof c.agency === 'number' && c.agency > 0.3) marks.push('lead drives it');
+    if (marks.length) {
+      const m = el('div');
+      m.style.marginTop = '6px';
+      const bad = new Set(['lead gets put through it', 'lead may be carried']);
+      for (const t of marks) m.append(el('span', 'tag ' + (bad.has(t) ? 'warn' : 'good'), t));
+      mid.append(m);
+    }
+    if (c.punished && c.punished.length) mid.append(el('div','why','punishing elements: ' + c.punished.join(', ')));
+    if (c.why.length) mid.append(el('div','why','because ' + c.why.map(w => `${w.name} ${w.contribution>0?'+':''}${w.contribution}`).join(', ')));
+    if (c.filters.blocked) mid.append(el('div','flag','blocked — ' + c.filters.ageReason));
+    else if (c.filters.needsJudgement) mid.append(el('div','flag','unclear — ' + c.filters.ageReason));
+    if (c.filters.audio === 'FLAG') mid.append(el('div','flag','Chinese-origin — needs a good JP or EN dub'));
+
+    row.append(mid); card.append(row);
+    return card;
+}
+
+// --- account, sync, and the copies of your library ---------------------------
+//
+// None of this existed when the hosted build was ported. The page got a storage layer with
+// accounts, sync, export, import and snapshots, and called none of it: sync never ran because
+// nothing asked it to, nobody could sign in, and the only copy of a library was IndexedDB — which
+// one press of "clear site data" removes, and which a browser may evict on its own.
+
+// Is there a server at all. config.isConfigured() is what decides it, and the page cannot reach
+// config.js: api-browser.js exports api, boot, store and routes. The store asks that question once
+// during init() and answers 'local-only' when it is false, so this reads the same decision through
+// the surface the page does have, rather than keeping a second copy of the placeholder check that
+// could quietly disagree with the first.
+function serverConfigured() {
+  return !!STORE && STORE.syncState().state !== 'local-only';
+}
+
+// Where this library actually lives, in the build that is actually running.
+//
+// One function, used by the first-run card and by the Data tab, because the sentence it replaced
+// had already drifted into being false: the first card a hosted user ever read told them nothing
+// here talks to any account, on a page whose whole point was that it does.
+function storageSentence() {
+  if (!BUNDLE) return 'Nothing here talks to any account, and everything stays in this folder.';
+  if (!serverConfigured()) {
+    return 'This library lives in this browser and is sent nowhere. Clearing site data clears it, '
+      + 'so keep an exported copy — the Data tab writes one to a file.';
+  }
+  return 'Your list is saved to a server the owner runs, so it follows you between devices. He can '
+    + 'technically read it, he does not share it or sell it, and you can export it or delete it '
+    + 'whenever you want.';
+}
+
+// --- the indicator ------------------------------------------------------------
+
+// state -> [colour, the word]. The store's own message is fuller and is shown in two places; this
+// is what has to survive being read in the corner of a header.
+const SYNC_LOOK = {
+  starting: ['', 'opening'],
+  'local-only': ['', 'this browser only'],
+  'signed-out': ['', 'not signed in'],
+  syncing: ['acc', 'syncing'],
+  idle: ['good', 'synced'],
+  offline: ['warn', 'offline'],
+  error: ['bad', 'sync problem'],
+  conflict: ['bad', 'two copies'],
+};
+
+let SYNC = { state: 'starting', message: '', pending: false, detail: null };
+
+function renderSync(s) {
+  if (s) SYNC = s;
+  // 'idle' means the last pass succeeded; `pending` means something has been saved since and has
+  // not gone up yet. Drawing that as "synced" is the one lie this indicator exists to prevent.
+  const [cls, word] = (SYNC.state === 'idle' && SYNC.pending)
+    ? ['warn', 'changes to send']
+    : (SYNC_LOOK[SYNC.state] || ['', SYNC.state]);
+  const pill = $('#syncPill');
+  if (pill) { pill.className = 'pill ' + cls; pill.textContent = word; pill.title = SYNC.message || word; }
+  const line = $('#syncLine');
+  if (line) line.textContent = SYNC.message || '';
+  renderConflict();
+}
+
+// A conflict is the one sync outcome that needs a person. Both copies hold real work, the store has
+// already decided which is live, and the other is a protected snapshot that will sit there being
+// ignored unless something says so loudly. It stays up until a later sync reports anything else.
+function renderConflict() {
+  const box = $('#conflictAlert');
+  if (!box) return;
+  if (SYNC.state !== 'conflict') { box.hidden = true; return; }
+  box.hidden = false;
+  box.textContent = '';
+  // The store's message already opens with "this library was changed in two places", so repeating
+  // it here would waste the one line somebody reads. What that message does not answer is the
+  // question it provokes — whether something is gone — and the store hands over the answer:
+  // `keptAs` is where the losing copy landed, or -1 if the snapshot itself failed.
+  const keptAs = (SYNC.detail && SYNC.detail.keptAs);
+  box.append(el('b', null, keptAs >= 0
+    ? 'Nothing was thrown away'
+    : 'One of the two copies could not be saved'));
+  box.append(el('div', null, SYNC.message));
+  const acts = el('div', 'acts');
+  const go = el('button', 'ghost', 'Open Backups');
+  go.onclick = () => { showTab('data'); const b = $('#backupList'); if (b) b.scrollIntoView({ block: 'center' }); };
+  acts.append(go);
+  acts.append(el('span', 'muted', 'the copy that did not win is in that list, and it can age out'));
+  box.append(acts);
+}
+
+// A browser in private mode, or one out of quota, takes every edit and keeps none of them.
+// api-browser.js prepends its own red line for this, which is what covers a failure during boot;
+// from here on the page owns the handler, because the warning has to sit inside the app's own
+// chrome, next to the next thing the user is about to do, and stay there. No dismiss button.
+let persistFailures = 0;
+function onPersistFailure(err) {
+  persistFailures++;
+  console.error('could not save the library:', (err && err.message) || err);
+  const box = $('#persistAlert');
+  if (!box) return;
+  box.hidden = false;
+  box.textContent = '';
+  box.append(el('b', null, 'This browser is refusing to save'));
+  box.append(el('div', null, ((err && err.message) || 'unknown error')
+    + '. Anything you change now lives in this tab and goes when you close it. A private window does '
+    + 'this, and so does a full disk. Export a copy before you carry on.'));
+  box.append(el('div', 'muted', persistFailures + ' failed saves so far'));
+  const acts = el('div', 'acts');
+  const go = el('button', 'ghost', 'Export a copy now');
+  go.onclick = () => { showTab('data'); };
+  acts.append(go);
+  box.append(acts);
+}
+
+// --- account ------------------------------------------------------------------
+
+function dataNote(sel, text, bad) {
+  const n = $(sel);
+  if (!n) return;
+  n.textContent = text;
+  n.style.color = bad ? 'var(--bad)' : '';
+}
+const acctSay = (text, bad) => dataNote('#acctNote', text, bad);
+
+// Every control below changes the stored library first and redraws second, so a redraw that throws
+// must not read as "nothing happened" — the old numbers would sit on screen while the store held
+// something else. It is reachable: /api/state throws on an entry that is not shaped like one, which
+// is what a truncated or hand-edited import file holds, and that is the exact moment somebody needs
+// to know which library they are looking at. Measured in a browser on 2026-08-01, importing
+// {"entries":[{"id":"z"}]} — the store took it, the page kept drawing the previous library, and the
+// only sign was a console line.
+//
+// The snapshot list is drawn again by hand here because it reads the store rather than the state,
+// so it survives the failure and is the way back out.
+async function redrawAfter(done, noteSel) {
+  try { await refresh(); return true; }
+  catch (err) {
+    console.error(`could not redraw after ${done}:`, err);
+    renderBackups();
+    dataNote(noteSel, `${done}, but this page cannot read the result: ${err.message}. What is on `
+      + 'screen is no longer what is stored, so reload before trusting it — and if it will not open, '
+      + 'the library you had is the newest snapshot in Backups below.', true);
+    return false;
+  }
+}
+
+// Why a failed sign-in gets three answers and not one.
+//
+// Supabase answers a wrong password and an address it has never seen with the SAME 400, on purpose:
+// telling them apart would let anyone use this form to find out whether a person has an account
+// here. So one sentence has to carry both, and it has to name the invite route, because "there is
+// no account yet" is the case a new friend hits first.
+//
+// Unreachable is the ordinary failure rather than the exotic one, and it must not be read as a
+// typo in a password that is fine: a free Supabase project pauses after seven days with no traffic
+// and then fails every request until the owner presses Restore (deploy/SUPABASE-SETUP.md).
+function signInTrouble(res) {
+  if (res.reason === 'credentials') {
+    return 'That email and password do not match — or there is no account for that address yet. The '
+      + 'server answers the same way for both, so that this page cannot be used to find out who has '
+      + 'an account. If you have never signed in here, ask whoever sent you the link to invite this '
+      + 'address.';
+  }
+  if (res.reason === 'offline' || res.reason === 'timeout' || res.reason === 'server') {
+    return 'Cannot reach the server, so this is not about your password. Free projects go to sleep '
+      + 'after a week of quiet and answer nothing until the owner wakes them, which is the usual '
+      + 'cause — tell him. Your library is safe on this device either way, and everything here keeps '
+      + 'working.';
+  }
+  if (res.reason === 'unconfigured') return 'This copy has no server configured, so there is nothing to sign in to.';
+  return res.message || 'sign-in failed';
+}
+
+function renderAccount() {
+  const configured = serverConfigured();
+  const user = STORE.currentUser();
+  $('#acctLocal').hidden = configured;
+  $('#acctOut').hidden = !configured || !!user;
+  $('#acctIn').hidden = !configured || !user;
+  if (user) $('#acctEmail').textContent = user.email || 'this account';
+}
+
+async function doSignIn() {
+  const pw = $('#acctPw');
+  const email = $('#acctEmailIn').value.trim();
+  if (!email || !pw.value) { acctSay('Type the address you were invited with, and its password.', true); return; }
+  const btn = $('#signInBtn');
+  btn.disabled = true;
+  acctSay('signing in…');
+  let res;
+  try { res = await STORE.signIn(email, pw.value); }
+  catch (e) { res = { ok: false, message: e.message }; }
+  // The password is held nowhere past this line: not in a variable, not in a message, not in the
+  // field it was typed into.
+  pw.value = '';
+  btn.disabled = false;
+  if (!res.ok) { acctSay(signInTrouble(res), true); return; }
+  renderAccount();
+  // signIn reconciles before returning, so by here the library on screen is the one that won —
+  // which is also why a redraw failure here means the server's copy is the unreadable one.
+  if (!await redrawAfter('Signed in', '#acctNote')) return;
+  acctSay(res.conflict
+    ? 'Signed in — and this device and the server had both changed. Both copies were kept; the one that is not live is in Backups.'
+    : 'Signed in.');
+}
+
+// Kept rather than removed. Public sign-up is off in the Supabase project on purpose, and Supabase
+// answers a blocked one with "Signups not allowed for this instance" — which reads as a broken site
+// to somebody who was told to make an account. This turns that into the sentence that helps.
+async function doSignUp() {
+  const pw = $('#acctPw');
+  const email = $('#acctEmailIn').value.trim();
+  if (!email || !pw.value) { acctSay('Type the address you want the account on, and a password for it.', true); return; }
+  const btn = $('#signUpBtn');
+  btn.disabled = true;
+  acctSay('asking the server…');
+  let res;
+  try { res = await STORE.signUp(email, pw.value); }
+  catch (e) { res = { ok: false, message: e.message }; }
+  pw.value = '';
+  btn.disabled = false;
+  if (res.ok) { acctSay('Account made. Sign in with it now.'); return; }
+  acctSay(res.reason === 'signup-disabled' ? res.message : signInTrouble(res), true);
+}
+
+// --- export, import, snapshots ------------------------------------------------
+
+function exportLibrary() {
+  const text = STORE.exportJSON();
+  const count = (STORE.load().entries || []).length;
+  const name = `nimeflow-library-${new Date().toISOString().slice(0, 10)}-${count}-titles.json`;
+  const blob = new Blob([text], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  return name;
+}
+
+// The most destructive control in the app, so it counts both libraries out loud before it runs.
+// A person picking the wrong file sees the wrong numbers here rather than after the fact — and the
+// snapshot importJSON takes is said in the same breath, because it is the difference between a
+// mistake and a loss.
+function askImport(filename, text, parsed) {
+  const now = STORE.load();
+  const mine = { entries: (now.entries || []).length, comparisons: (now.comparisons || []).length };
+  const theirs = { entries: parsed.entries.length, comparisons: (parsed.comparisons || []).length };
+
+  const box = $('#importConfirm');
+  box.textContent = '';
+  const panel = el('div', 'alert bad');
+  panel.append(el('b', null, 'Replace this library with ' + filename + '?'));
+
+  const t = el('table');
+  t.innerHTML = '<thead><tr><th></th><th>here now</th><th>in that file</th></tr></thead>';
+  const tb = el('tbody');
+  const row = (label, a, b) => {
+    const tr = el('tr');
+    tr.append(el('td', 'muted', label));
+    tr.append(el('td', null, String(a)));
+    tr.append(el('td', null, String(b)));
+    tb.append(tr);
+  };
+  row('titles', mine.entries, theirs.entries);
+  row('ranking answers', mine.comparisons, theirs.comparisons);
+  t.append(tb);
+  panel.append(t);
+
+  // Said only when it is true. A smaller file is usually an older export, and that is the case
+  // where somebody is about to undo work they still want.
+  if (theirs.entries < mine.entries || theirs.comparisons < mine.comparisons) {
+    panel.append(el('div', 'flag', 'That file holds less than what is here. If it is an older export, everything newer goes.'));
+  }
+  panel.append(el('div', 'muted', 'Nothing is merged. What is here now is snapshotted first and appears in Backups below, so this is undoable.'));
+
+  const acts = el('div', 'acts');
+  const go = el('button', 'go', `Replace my library with these ${theirs.entries} titles`);
+  go.onclick = async () => {
+    go.disabled = true;
+    try { STORE.importJSON(text); }
+    catch (e) { go.disabled = false; dataNote('#importNote', 'import failed: ' + e.message, true); return; }
+    box.textContent = '';
+    // Cleared so that picking the same file again still fires a change event.
+    $('#importFile').value = '';
+    if (await redrawAfter('The file was imported', '#importNote')) {
+      dataNote('#importNote', `imported ${theirs.entries} titles and ${theirs.comparisons} answers — the library you had is the newest entry in Backups`);
+    }
+  };
+  const no = el('button', 'ghost', 'Cancel');
+  no.onclick = () => { box.textContent = ''; $('#importFile').value = ''; dataNote('#importNote', ''); };
+  acts.append(go, no);
+  panel.append(acts);
+  box.append(panel);
+}
+
+function renderBackups() {
+  const box = $('#backupList');
+  if (!box) return;
+  box.textContent = '';
+  const list = STORE.listBackups();
+  if (!list.length) {
+    box.append(el('div', 'empty', 'No snapshots yet. One is taken before the library is overwritten, at most one every ten minutes.'));
+    return;
+  }
+  const t = el('table');
+  t.innerHTML = '<thead><tr><th>Taken</th><th>Titles</th><th>Answers</th><th>Why</th><th></th></tr></thead>';
+  const tb = el('tbody');
+  // Newest first: the one somebody is looking for is almost always the last thing that happened.
+  for (const b of list.slice().reverse()) {
+    const tr = el('tr');
+    tr.append(el('td', null, new Date(b.at).toLocaleString()));
+    tr.append(el('td', 'muted', String(b.entries)));
+    tr.append(el('td', 'muted', String(b.comparisons)));
+    const why = el('td', 'muted', b.note || 'routine snapshot');
+    // Protected ones are the conflict losers and the pre-import copies. They survive pruning while
+    // any routine snapshot is left, and saying so tells a person which rows they can ignore.
+    if (b.protected) why.append(el('span', 'tag acc', 'kept'));
+    tr.append(why);
+    const act = el('td');
+    const go = el('button', 'ghost', 'Restore');
+    go.onclick = async () => {
+      go.disabled = true;
+      try { STORE.restoreBackup(b.index); }
+      catch (e) { go.disabled = false; dataNote('#backupNote', 'restore failed: ' + e.message, true); return; }
+      if (await redrawAfter('That snapshot was restored', '#backupNote')) {
+        dataNote('#backupNote', `Restored the snapshot from ${new Date(b.at).toLocaleString()}. What you had a moment ago is now the newest snapshot here, so you can go straight back.`);
+      }
+    };
+    act.append(go);
+    tr.append(act);
+    tb.append(tr);
+  }
+  t.append(tb);
+  box.append(t);
+}
+
+// --- the app asks for a file, once --------------------------------------------
+//
+// IndexedDB is not a place a person chose to keep anything. A browser can evict it, and "clear site
+// data" sits one menu item away from the things people do click. A friend will not think of this
+// until after it has happened, so the app has to raise it — and then never again, because a warning
+// that repeats is a warning that gets clicked away without reading.
+//
+// THE THRESHOLD, off the two gates the app already measures rather than a third number invented
+// here. Titles are not what is expensive: the Add tab exists to take them back in as fast as
+// somebody can type them out of their head. The comparison log is: it is answers to questions the
+// app chose, every score is replayed from it, and nothing can reconstruct it. Recommendations turn
+// on at gates.shelves ranked titles, and the ranking settles around settlesAround answers, so a
+// third of the way there is the first point where the log holds real work and the app is already
+// doing something with it. Asking earlier would be nagging about a library worth a minute.
+const ASK_KEY = 'nimeflow.exportAsked';
+let askedThisSession = false;
+
+function exportAsked() {
+  if (askedThisSession) return true;
+  try { return localStorage.getItem(ASK_KEY) === '1'; } catch { return false; }
+}
+function markExportAsked() {
+  // A browser that refuses localStorage still must not be asked twice in one sitting.
+  askedThisSession = true;
+  try { localStorage.setItem(ASK_KEY, '1'); } catch { /* private mode; the flag above covers it */ }
+}
+
+function renderExportPrompt() {
+  const box = $('#exportAlert');
+  if (!box) return;
+  const o = (STATE && STATE.onboarding) || {};
+  const gates = o.gates || {};
+  const worthLosing = o.ranked >= gates.shelves && o.comparisons >= Math.round(o.settlesAround / 3);
+  if (!worthLosing || exportAsked()) { box.hidden = true; return; }
+
+  box.hidden = false;
+  box.textContent = '';
+  // Signed in AND actually up to date. Pending changes or a failed pass mean the server copy is not
+  // the one on screen, which is the case where a lower-risk sentence would be wrong.
+  const synced = !!STORE.currentUser() && SYNC.state === 'idle' && !SYNC.pending;
+  box.append(el('b', null, 'Keep a copy where nothing can clear it'));
+  box.append(el('div', null, synced
+    ? `Your ${STATE.total} titles and ${o.comparisons} ranking answers are on the server as well as in `
+      + 'this browser, so a cleared browser is not the end of them. A file on your own disk is the copy '
+      + 'that also survives a sleeping server, a lost account, and a sync that went the wrong way.'
+    : `This browser is the only place your ${STATE.total} titles and ${o.comparisons} ranking answers `
+      + 'exist. One press of "clear site data" ends them, and a browser can decide on its own that '
+      + 'storage this old is stale. The titles you could retype from memory; the answers you could not.'));
+  const acts = el('div', 'acts');
+  const go = el('button', 'go', 'Export a copy');
+  go.onclick = () => {
+    const name = exportLibrary();
+    markExportAsked();
+    box.hidden = true;
+    showTab('data');
+    dataNote('#exportNote', 'saved ' + name);
+  };
+  const no = el('button', 'ghost', 'Not now');
+  no.onclick = () => { markExportAsked(); box.hidden = true; };
+  acts.append(go, no);
+  acts.append(el('span', 'muted', 'asked once — the button stays on the Data tab'));
+  box.append(acts);
+}
+
+// --- wiring -------------------------------------------------------------------
+
+function renderData() {
+  if (!STORE) return;
+  dataNote('#dataWhere', storageSentence());
+  renderAccount();
+  renderBackups();
+  renderExportPrompt();
+}
+
+if (!STORE) {
+  // The desktop build. Removing both is the honest version of "this build has no account": a tab
+  // full of dead buttons would be worse than no tab.
+  const tab = $('nav button[data-tab=data]');
+  if (tab) tab.remove();
+  const sec = $('#data');
+  if (sec) sec.remove();
+} else {
+  $('#syncPill').onclick = () => showTab('data');
+  $('#signInBtn').onclick = doSignIn;
+  $('#signUpBtn').onclick = doSignUp;
+  $('#acctPw').onkeydown = (ev) => { if (ev.key === 'Enter') doSignIn(); };
+  $('#signOutBtn').onclick = async () => {
+    const b = $('#signOutBtn');
+    b.disabled = true;
+    acctSay('signing out — sending anything unsaved first…');
+    try { await STORE.signOut(); acctSay('Signed out. This library is still on this device.'); }
+    catch (e) { acctSay('sign out failed: ' + e.message, true); }
+    b.disabled = false;
+    renderAccount();
+  };
+  $('#syncNowBtn').onclick = async () => {
+    const b = $('#syncNowBtn');
+    b.disabled = true;
+    try { await STORE.syncNow(); } catch (e) { acctSay('sync failed: ' + e.message, true); }
+    b.disabled = false;
+    // A sync can adopt the server's copy, so what is on screen may no longer be the library.
+    await redrawAfter('The sync finished', '#acctNote');
+  };
+  $('#exportBtn').onclick = () => {
+    markExportAsked();
+    dataNote('#exportNote', 'saved ' + exportLibrary());
+  };
+  $('#importFile').onchange = async () => {
+    const file = $('#importFile').files && $('#importFile').files[0];
+    $('#importConfirm').textContent = '';
+    dataNote('#importNote', '');
+    if (!file) return;
+    let text;
+    try { text = await file.text(); }
+    catch (e) { dataNote('#importNote', 'could not read that file: ' + e.message, true); return; }
+    let parsed;
+    // Read before the confirmation panel rather than inside importJSON, so a file that was never a
+    // library fails on its own terms instead of behind a button that says it will replace things.
+    try { parsed = JSON.parse(text); }
+    catch { dataNote('#importNote', 'that file is not JSON — pick one this app exported', true); return; }
+    if (!parsed || !Array.isArray(parsed.entries)) {
+      dataNote('#importNote', 'that file is not a library export — there is no list of titles in it', true);
+      return;
+    }
+    askImport(file.name, text, parsed);
+  };
+}
+
+// Attached after boot() rather than before it: api-browser.js sets its own persist handler in
+// there, and the store keeps one, so wiring first would be wiring nothing.
+function wireStore() {
+  if (!STORE) return;
+  STORE.setPersistErrorHandler(onPersistFailure);
+  STORE.setSyncHandler(renderSync);
+  $('#syncPill').hidden = false;
+  // init() has already run and its status change fired into nobody. Read where things stand rather
+  // than sitting on "opening" until the next event.
+  renderSync(STORE.syncState());
+}
+
+// The hosted build opens its library before the first call: store.load() is synchronous and
+// throws until init() has read IndexedDB. The desktop build has nothing to open.
+(BUNDLE ? BUNDLE.boot() : Promise.resolve())
+  .then(wireStore)
+  .then(refresh)
+  .catch(e => document.body.prepend(el('div','err','could not load state: ' + e.message)));
+</script>
+</body>
+</html>

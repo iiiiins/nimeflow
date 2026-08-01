@@ -1642,13 +1642,19 @@ function wireStore() {
   // Somebody who followed an invite has an empty library, so refresh() would put them on Add —
   // and the panel asking them to choose a password lives on Data, where they would never look.
   // The first screen a friend ever sees has to be the one thing they must do.
-  if (STORE.syncState().state === 'arriving') {
-    showTab('data');
-    const box = $('#acctArrive');
-    if (box) box.scrollIntoView({ block: 'center' });
-    const pw = $('#acctNewPw');
-    if (pw) pw.focus();
-  }
+  //
+  // The tab switch happens here; the scroll and the focus wait until after refresh(), because
+  // renderAccount is what unhides the panel and focusing a hidden element does nothing. Measured
+  // on the live site: the panel showed correctly and the cursor was nowhere.
+  if (STORE.syncState().state === 'arriving') showTab('data');
+}
+
+function focusArrival() {
+  if (!STORE || STORE.syncState().state !== 'arriving') return;
+  const box = $('#acctArrive');
+  if (box) box.scrollIntoView({ block: 'center' });
+  const pw = $('#acctNewPw');
+  if (pw) pw.focus();
 }
 
 // The hosted build opens its library before the first call: store.load() is synchronous and
@@ -1656,6 +1662,7 @@ function wireStore() {
 (BUNDLE ? BUNDLE.boot() : Promise.resolve())
   .then(wireStore)
   .then(refresh)
+  .then(focusArrival)
   .catch(e => document.body.prepend(el('div','err','could not load state: ' + e.message)));
 </script>
 </body>

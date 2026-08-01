@@ -281,6 +281,44 @@ async function searchMany(items, perPage = 5) {
   return out;
 }
 
+// Type-ahead for one term, across BOTH media at once.
+//
+// Why this exists at all: the Add tab was a blank textarea telling people to write things down.
+// That works for the flow it was built for — paste a history you already have — and it is useless
+// for the thing people actually do afterwards, which is add one title they just finished and are
+// not sure how to spell. There was no search anywhere in the app.
+//
+// ANIME and MANGA go in one request as two aliases rather than two round trips, because this runs
+// on a keystroke and AniList allows 90 requests a minute. searchMany pins the type for a reason
+// (an untyped search returns the source manga for an anime title and corrupts the owed queue), so
+// the two are kept separate and merged here rather than asking for both loosely.
+//
+// POPULARITY_DESC, not SEARCH_MATCH. Typing "one" should offer One Piece, and SEARCH_MATCH ranks
+// on string closeness, which puts obscure exact-prefix titles above the thing anybody means.
+async function suggest(term, perType = 6) {
+  const q = String(term || '').trim();
+  if (q.length < 2) return [];
+  const data = await gql(`query ($q: String) {
+    anime: Page(perPage: ${perType}) {
+      media(search: $q, type: ANIME, sort: [POPULARITY_DESC]) { ${MEDIA_FIELDS} }
+    }
+    manga: Page(perPage: ${perType}) {
+      media(search: $q, type: MANGA, sort: [POPULARITY_DESC]) { ${MEDIA_FIELDS} }
+    }
+  }`, { q });
+
+  // Interleaved, so a manga search is not buried under six anime. Somebody typing a manhwa title
+  // gets it in the first two rows rather than the seventh.
+  const anime = (data.anime && data.anime.media) || [];
+  const manga = (data.manga && data.manga.media) || [];
+  const out = [];
+  for (let i = 0; i < Math.max(anime.length, manga.length); i++) {
+    if (anime[i]) out.push(anime[i]);
+    if (manga[i]) out.push(manga[i]);
+  }
+  return out;
+}
+
 async function searchPass(items, perPage, out) {
   const CHUNK = 8;
   for (let i = 0; i < items.length; i += CHUNK) {
@@ -392,7 +430,7 @@ function rateInfo() {
   return { ...lastRate, usedThisMinute: recent, selfCap: MAX_PER_MIN };
 }
 
-module.exports = { gql, searchMany, mediaByIds, discoverByTags, recommendationsFrom, rateInfo, MEDIA_FIELDS };
+module.exports = { gql, searchMany, suggest, mediaByIds, discoverByTags, recommendationsFrom, rateInfo, MEDIA_FIELDS };
 };
 
 // ---- web-src/api-browser.js --------------------------------------------------
@@ -1232,6 +1270,131 @@ function cover(members) {
 }
 
 module.exports = { cluster, label, cleanLabel, cover, SAME_WORK };
+};
+
+// ---- lib/linking.js ----------------------------------------------------------
+__modules["linking"] = function (module, exports, require) {
+'use strict';
+
+// Attach MangaDex ids to reading entries, so chapter tracking has something to track.
+//
+// WHY THIS IS A LIBRARY AND NOT A SCRIPT. It began as `tools/link-mangadex.js`, a command-line
+// tool run once by the person who built the app. That made chapter tracking unreachable for
+// everybody else: the hosted build has no command line, so a friend pressed "check for new
+// chapters", got "checked 0" forever, and nothing anywhere said why. The proxy that exists purely
+// to make MangaDex reachable from a browser had no user-visible purpose at all.
+//
+// So the matching lives here and has three callers: the CLI, the desktop server, and the hosted
+// page. One implementation, or the two builds disagree about which manga a title is.
+//
+// MATCHING IS DONE AGAINST EVERY TITLE VARIANT ON BOTH SIDES. An AniList entry carries
+// english/romaji/native, and MangaDex stores titles romanised as often as not (The Greatest
+// Estate Developer is filed as "Yeokdaegeum Yeongji Seolgyesa"). Searching one string against one
+// string misses badly.
+//
+// ANYTHING BELOW THE BAR IS REPORTED, NEVER GUESSED IN. A wrong mangadexId reports the wrong
+// chapter count forever, and it does it quietly: the number looks like an answer. An unlinked
+// entry is a visible gap; a mislinked one is a lie. That asymmetry is why this returns candidates
+// for a person to choose from rather than taking its best guess.
+
+const md = require('./mangadex');
+
+// 100 is an exact match on some title variant, 80 a prefix match. Below that, a human looks.
+const CONFIDENT = 80;
+
+function isReading(entry) {
+  return entry.medium === 'MANGA' || entry.medium === 'NOVEL';
+}
+
+// Which entries this can even work on, and why each of the others is excluded. The UI needs the
+// reasons: "nothing to link" and "you have no manga" are different sentences.
+function linkable(db) {
+  const reading = db.entries.filter(isReading);
+  return {
+    reading,
+    unlinked: reading.filter((e) => !e.mangadexId),
+    linked: reading.filter((e) => e.mangadexId),
+  };
+}
+
+// Find the best MangaDex match for one entry, searching each title variant it has.
+async function candidatesFor(entry, limit = 8) {
+  const queries = [
+    entry.meta.title && entry.meta.title.english,
+    entry.meta.title && entry.meta.title.romaji,
+    entry.meta.title && entry.meta.title.native,
+    entry.meta.display,
+  ].filter(Boolean);
+
+  // Deduplicated by id, keeping the highest confidence any query produced for it. The same manga
+  // comes back from several variants, and the english search often scores it lower than the
+  // native one does.
+  const byId = new Map();
+  for (const q of [...new Set(queries)]) {
+    const hits = await md.findManga(q, limit);
+    for (const h of hits) {
+      const prev = byId.get(h.id);
+      if (!prev || h.confidence > prev.confidence) byId.set(h.id, h);
+    }
+    const top = [...byId.values()].sort((a, b) => b.confidence - a.confidence)[0];
+    if (top && top.confidence >= 100) break;   // an exact variant match; more searching cannot beat it
+  }
+
+  return [...byId.values()].sort((a, b) => b.confidence - a.confidence).slice(0, limit);
+}
+
+// Link what is certain, report what is not.
+//
+// `onProgress` exists because this is one network round trip per title against a rate-limited
+// API. A page that goes blank for forty seconds is a page somebody reloads halfway through.
+async function linkAll(db, { onProgress, only } = {}) {
+  const { unlinked } = linkable(db);
+  const targets = only ? unlinked.filter((e) => e.id === only) : unlinked;
+
+  const linked = [];
+  const unsure = [];
+  const failed = [];
+
+  let done = 0;
+  for (const entry of targets) {
+    let hits;
+    try {
+      hits = await candidatesFor(entry);
+    } catch (err) {
+      // One unreachable lookup must not abandon the rest. A missing proxy, a rate limit and a
+      // dropped connection all land here, and the message names which.
+      failed.push({ id: entry.id, title: entry.meta.display, error: err.message });
+      done++;
+      if (onProgress) onProgress({ done, total: targets.length, title: entry.meta.display });
+      continue;
+    }
+
+    const best = hits[0];
+    if (best && best.confidence >= CONFIDENT) {
+      entry.mangadexId = best.id;
+      entry.mangadexTitle = best.title;
+      entry.updatedAt = new Date().toISOString();
+      linked.push({ id: entry.id, title: entry.meta.display, matched: best.title, confidence: best.confidence, mangadexId: best.id });
+    } else {
+      unsure.push({
+        id: entry.id,
+        title: entry.meta.display,
+        // The candidates travel with it, so choosing one is a click rather than another search.
+        candidates: hits.slice(0, 5).map((h) => ({
+          id: h.id, title: h.title, confidence: h.confidence, year: h.year,
+          status: h.status, originalLanguage: h.originalLanguage,
+          variants: h.variants.slice(0, 3),
+        })),
+      });
+    }
+    done++;
+    if (onProgress) onProgress({ done, total: targets.length, title: entry.meta.display });
+  }
+
+  return { linked, unsure, failed, attempted: targets.length };
+}
+
+module.exports = { linkAll, candidatesFor, linkable, isReading, CONFIDENT };
 };
 
 // ---- lib/mangadex.js ---------------------------------------------------------
@@ -2120,6 +2283,7 @@ const { fit } = require('../lib/fit');
 const { extent } = require('../lib/extent');
 const mangadex = require('../lib/mangadex');
 const { parseBlock } = require('../lib/parse');
+const linking = require('../lib/linking');
 
 // title -> {chapters,status,matched} or null for a known miss. Page-lifetime only: a reload
 // re-checks, which is the right cadence for a number that changes when a series does.
@@ -2282,6 +2446,51 @@ const routes = {
 
   // Paste a freeform list, get back parsed lines each with AniList candidates to confirm.
   // Nothing is written here — confirmation is a separate, explicit step.
+  // Type-ahead for the Add box. See server.js for the same handler and the reasoning.
+  'GET /api/suggest': async ({ query }) => {
+    const q = String(query.get('q') || '').trim();
+    const db = store.load();
+    const owned = new Set(db.entries.map((e) => e.id));
+
+    // The user's OWN library first, matched locally and instantly. It is the answer to the most
+    // common reason a search finds nothing useful — they already have it — and it costs no
+    // request, so it shows while AniList is still thinking.
+    const mine = q.length >= 2 ? db.entries
+      .filter((e) => e.meta.display.toLowerCase().includes(q.toLowerCase()))
+      .slice(0, 4)
+      .map((e) => ({
+        id: e.id, anilistId: e.meta.anilistId, medium: e.medium,
+        title: e.meta.display, cover: e.meta.cover, year: e.meta.seasonYear,
+        format: e.meta.format, country: e.meta.countryOfOrigin,
+        releaseStatus: e.meta.releaseStatus, totalUnits: e.meta.totalUnits,
+        averageScore: e.meta.averageScore, alreadyHave: true, mine: true,
+      })) : [];
+
+    if (q.length < 2) return { q, results: [], mine, note: null };
+
+    const media = await anilist.suggest(q);
+    const results = media.map((m) => {
+      const meta = store.fromAniList(m);
+      const medium = m.type === 'MANGA' ? (m.format === 'NOVEL' ? 'NOVEL' : 'MANGA') : 'ANIME';
+      return {
+        id: `${medium.toLowerCase()}-${m.id}`,
+        anilistId: m.id, medium,
+        title: meta.display, cover: meta.cover, year: meta.seasonYear,
+        format: meta.format, country: meta.countryOfOrigin,
+        releaseStatus: meta.releaseStatus, totalUnits: meta.totalUnits,
+        averageScore: meta.averageScore,
+        alreadyHave: owned.has(`${medium.toLowerCase()}-${m.id}`),
+      };
+    }).filter((r) => !mine.some((m) => m.id === r.id));
+
+    // AniList's own index is poor at partial words, measured 2026-08-02: "frie" and "frier"
+    // return nothing while "friere" returns Frieren, on both SEARCH_MATCH and POPULARITY_DESC.
+    // An empty dropdown reads as "this title does not exist", so the reason is said out loud.
+    const note = results.length || mine.length ? null
+      : 'AniList found nothing for that yet — its search needs most of a word. Try another letter or two.';
+    return { q, results, mine, note, rate: anilist.rateInfo() };
+  },
+
   'POST /api/parse': async ({ body }) => {
     const { text } = body;
     const parsed = parseBlock(text);
@@ -2399,6 +2608,20 @@ const routes = {
 
   // Refresh chapter numbers for the reading half. Throttled to ~4 req/s inside the client;
   // MangaDex bans IPs for hammering, so this is deliberately not fast.
+  // Attach MangaDex ids, so chapter tracking has something to track.
+  //
+  // This was a command-line tool and nothing else, which meant the feature could only ever be
+  // switched on by the person who built the app. Everyone else pressed "check for new chapters"
+  // and read "checked 0" forever, with no account of why and no way to change it. Same handler as
+  // server.js, over lib/linking.js, because two implementations would disagree about which manga
+  // a title is.
+  'POST /api/link-mangadex': async ({ body }) => {
+    // Inside the lock and over a freshly read library, for the same reason as the sync below: one
+    // lookup per title against a rate-limited API is tens of seconds of holding a snapshot.
+    const result = await store.withWrite(async (fresh) => linking.linkAll(fresh, { only: body.id || null }));
+    return { ...result, state: buildState() };
+  },
+
   'POST /api/sync-chapters': async () => {
     // The library is re-read and written INSIDE the lock, after the network work.
     //
@@ -3046,7 +3269,7 @@ function makeEntry({ medium, meta, status = 'PLANNED', progress = 0, score = nul
 //
 // "I forgot a few, here is my whole list again" is the most natural thing a new user does.
 const USER_OWNED = ['progress', 'score', 'scoreSource', 'notes', 'pausedReason', 'sessions',
-  'verdict', 'nostalgia', 'franchiseComplete', 'recoveredHistory', 'mangadexId', 'chapters', 'acknowledged'];
+  'verdict', 'nostalgia', 'franchiseComplete', 'recoveredHistory', 'mangadexId', 'mangadexTitle', 'chapters', 'acknowledged'];
 
 function upsert(db, entry) {
   const i = db.entries.findIndex((e) => e.id === entry.id);
@@ -3096,7 +3319,7 @@ function patch(db, id, changes) {
   // request carrying `meta` or `id` could put the library in a shape that throws on every
   // subsequent load — permanently, because it is then on disk.
   const SETTABLE = new Set(['status', 'score', 'notes', 'pausedReason', 'verdict', 'nostalgia',
-    'franchiseComplete', 'recoveredHistory', 'sessions', 'acknowledged', 'chapters', 'mangadexId',
+    'franchiseComplete', 'recoveredHistory', 'sessions', 'acknowledged', 'chapters', 'mangadexId', 'mangadexTitle',
     'standalone', 'fromRecommender']);
   for (const [k, v] of Object.entries(changes)) if (SETTABLE.has(k)) e[k] = v;
   e.updatedAt = nowISO();
@@ -5095,6 +5318,6 @@ module.exports = { ageVerdict, audioVerdict, applyFilters, owed, tasteProfile, s
 var __app = __require("api-browser");
 // What this build actually contains. It is the one thing a deployed page cannot otherwise be
 // asked, and it is what the build's own check asserts against.
-__app.modules = ["adaptations","anilist","api-browser","axes","chapters","config","extent","fit","foryou","franchise","mangadex","parse","progression","rank","routes","store-core","store-web","supabase","taste"];
+__app.modules = ["adaptations","anilist","api-browser","axes","chapters","config","extent","fit","foryou","franchise","linking","mangadex","parse","progression","rank","routes","store-core","store-web","supabase","taste"];
 window.NimeFlow = __app;
 })();

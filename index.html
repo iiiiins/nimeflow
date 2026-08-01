@@ -110,15 +110,31 @@
     <h2>What you're owed</h2>
     <p class="sub">Only things with something to do. Bump an episode, say you're caught up, pin what you're watching next, or wave a sequel off for good — every button clears the card, which is what keeps this a queue and not a second library. Sequels that were only <em>announced</em> show up too, which is the case every other tracker misses.</p>
     <div style="margin-bottom:14px;display:flex;gap:10px;align-items:center">
+      <button class="ghost" id="linkBtn">Find these on MangaDex</button>
       <button class="ghost" id="syncBtn">Check for new chapters</button>
       <button class="ghost" id="adaptBtn">Check for adaptations</button>
       <span class="muted" id="syncNote"></span>
     </div>
+    <!-- Titles the matcher would not guess at. A wrong id reports a wrong chapter count forever
+         and looks like an answer, so these are shown rather than assumed. -->
+    <div id="linkPicks"></div>
     <div id="owedList"></div>
   </section>
 
   <section id="add">
-    <h2>Add — paste a list</h2>
+    <h2>Add</h2>
+    <!-- Search first, paste second, and this is the order on purpose. The paste box was the only
+         thing here: a blank textarea telling people to write a list. That is right for the day
+         somebody arrives with a history to enter, and it is the wrong shape for every day after,
+         when they want to add the one thing they just finished and are not sure how it is spelt. -->
+    <p class="sub">Search for one title, or paste a whole list further down.</p>
+    <div style="position:relative;max-width:520px">
+      <input type="search" id="findBox" placeholder="search anime and manga…" autocomplete="off"
+             style="width:100%;padding:11px 12px;font-size:15px">
+      <div id="findOut"></div>
+    </div>
+
+    <h3 style="margin-top:30px">Or paste a list</h3>
     <p class="sub">Type it the way you'd say it, one per line. "blue lock both seasons completed", "one piece - up to ep 1050 - dropped it", "the greatest estate developer (webtoon)". It parses status, episode counts and medium, then asks you to confirm anything it had to guess. Nothing is saved until you press commit.</p>
     <textarea id="dump" placeholder="one title per line…"></textarea>
     <div style="margin:10px 0 20px;display:flex;gap:10px;align-items:center">
@@ -621,6 +637,76 @@ $('#adaptBtn').onclick = async () => {
   b.disabled = false;
 };
 
+// Attach MangaDex ids. Without this, "check for new chapters" has nothing to check and says
+// "checked 0" forever — which is what every user except the one who built the app used to see,
+// because linking was a command-line tool.
+$('#linkBtn').onclick = async () => {
+  const b = $('#linkBtn'); b.disabled = true;
+  $('#syncNote').style.color = '';
+  $('#syncNote').textContent = 'searching MangaDex for your manga (throttled — it bans IPs for hammering)…';
+  try {
+    const r = await api('/api/link-mangadex', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    STATE = r.state; renderAll();
+    renderLinkPicks(r.unsure || []);
+    const bits = [];
+    if (r.linked.length) bits.push(`linked ${r.linked.length}`);
+    if (r.unsure.length) bits.push(`${r.unsure.length} need you to choose`);
+    if (r.failed.length) bits.push(`${r.failed.length} could not be looked up (${r.failed[0].error})`);
+    if (!r.attempted) bits.push('everything readable is already linked');
+    $('#syncNote').textContent = bits.join(' · ');
+    $('#syncNote').style.color = r.failed.length ? 'var(--warn)' : '';
+  } catch (e) {
+    $('#syncNote').textContent = 'failed: ' + e.message;
+    $('#syncNote').style.color = 'var(--warn)';
+  }
+  b.disabled = false;
+};
+
+// The ones it would not guess. Each gets its real candidates, so choosing is a click.
+function renderLinkPicks(unsure) {
+  const box = $('#linkPicks');
+  box.innerHTML = '';
+  if (!unsure.length) return;
+  box.append(el('p', 'sub', `${unsure.length} could not be matched confidently. A wrong match reports the wrong chapter count forever without ever looking wrong, so these are left to you.`));
+  for (const u of unsure) {
+    const card = el('div', 'card');
+    card.append(el('b', null, u.title));
+    if (!u.candidates.length) {
+      card.append(el('p', 'sub', 'MangaDex returned nothing for any of its titles. It may not be hosted there.'));
+      box.append(card);
+      continue;
+    }
+    const list = el('div', 'acts');
+    for (const c of u.candidates) {
+      const btn = el('button', 'ghost', `${c.title.slice(0, 42)} · ${c.confidence}% · ${c.originalLanguage || '?'}/${c.status || '?'}${c.year ? ' · ' + c.year : ''}`);
+      btn.title = c.variants.join(' | ');
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+          // Reuses the ordinary entry patch: mangadexId is already a field a client may set, so
+          // choosing a match needs no route of its own. It answers with the entry rather than the
+          // whole state, so the refresh is explicit.
+          await api('/api/entry', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: u.id, changes: { mangadexId: c.id, mangadexTitle: c.title } }),
+          });
+          await refresh();
+          card.replaceChildren(el('p', 'sub', `${u.title} → ${c.title}. Press "check for new chapters" to pull its count.`));
+        } catch (e) {
+          btn.disabled = false;
+          card.append(el('p', 'err', 'could not save that: ' + e.message));
+        }
+      };
+      list.append(btn);
+    }
+    const none = el('button', 'ghost', 'none of these');
+    none.onclick = () => { card.replaceChildren(el('p', 'sub', `${u.title} left unlinked.`)); };
+    list.append(none);
+    card.append(list);
+    box.append(card);
+  }
+}
+
 $('#syncBtn').onclick = async () => {
   const b = $('#syncBtn'); b.disabled = true; $('#syncNote').textContent = 'asking MangaDex (throttled — it bans IPs for hammering)…';
   try {
@@ -645,6 +731,91 @@ $('#syncBtn').onclick = async () => {
 // --- add flow ---------------------------------------------------------------
 
 let PARSED = [];
+
+// --- search ------------------------------------------------------------------
+//
+// A hit becomes a row in the SAME confirm list the paste flow builds, so status, progress and
+// commit are one code path rather than two that drift. The row shape is exactly what /api/parse
+// returns: a raw line, one or more candidates, a chosen index and a guess.
+//
+// Debounced, and every request carries a sequence number. Typing "solo leveling" fires several
+// searches, they finish out of order, and without the check an early one lands last and replaces
+// the results for a word the user has stopped typing.
+let findSeq = 0;
+let findTimer = null;
+
+function renderFind(res) {
+  const box = $('#findOut');
+  box.innerHTML = '';
+  const rows = [...(res.mine || []), ...(res.results || [])];
+  if (!rows.length) {
+    if (res.note) box.append(el('div', 'sub', res.note));
+    return;
+  }
+  const list = el('div', 'card');
+  list.style.cssText = 'margin-top:6px;max-height:420px;overflow:auto';
+  for (const c of rows) {
+    const row = el('div', 'row');
+    row.style.cssText = 'align-items:center;gap:10px;padding:6px 0;cursor:pointer';
+    if (c.cover) { const i = el('img', 'cov'); i.src = c.cover; i.loading = 'lazy'; i.style.width = '38px'; row.append(i); }
+    const text = el('div'); text.style.flex = '1';
+    text.append(el('div', null, c.title));
+    const bits = [c.medium, c.format, c.year, c.country].filter(Boolean).join(' · ');
+    text.append(el('div', 'meta', bits + (c.mine ? ' — already in your library' : c.alreadyHave ? ' — already in your library' : '')));
+    row.append(text);
+    if (!c.alreadyHave) row.append(el('span', 'muted', 'add'));
+    row.onclick = () => {
+      if (c.alreadyHave) { showTab('library'); return; }
+      // A guess, not a question. PLANNED with no progress is the honest default for a title
+      // somebody just looked up, and the row that appears below lets them change both before
+      // anything is saved.
+      // The shape /api/parse returns, in full. `uncertain` is a list the confirm step iterates
+      // over unconditionally; leaving it off threw inside renderParsed, which silently rendered
+      // nothing — the click cleared the box and produced no row. Found in a browser, not by
+      // reading, because the throw never reached the console.
+      //
+      // It is empty here on purpose: the parser has a list of things it had to guess from a
+      // typed line, and a title picked off a search result has none of them.
+      PARSED.unshift({
+        raw: c.title,
+        title: c.title,
+        candidates: [c],
+        chosen: 0,
+        guess: { status: 'PLANNED', medium: c.medium, episodes: null, seasons: null, wholeFranchise: false, alsoRead: false },
+        uncertain: [],
+        notes: '',
+        viaShortened: false,
+        fromSearch: true,
+      });
+      $('#findBox').value = '';
+      box.innerHTML = '';
+      renderParsed();
+      $('#parseOut').scrollIntoView({ block: 'nearest' });
+    };
+    list.append(row);
+  }
+  box.append(list);
+}
+
+$('#findBox').oninput = () => {
+  const q = $('#findBox').value.trim();
+  clearTimeout(findTimer);
+  if (q.length < 2) { $('#findOut').innerHTML = ''; return; }
+  // 280ms: long enough that a normal typing speed sends one request per word rather than per
+  // letter, which matters because AniList self-throttles at 22 requests a minute.
+  findTimer = setTimeout(async () => {
+    const seq = ++findSeq;
+    try {
+      const r = await api('/api/suggest?q=' + encodeURIComponent(q));
+      if (seq !== findSeq) return;   // a later keystroke already won
+      renderFind(r);
+    } catch (e) {
+      if (seq !== findSeq) return;
+      $('#findOut').innerHTML = '';
+      $('#findOut').append(el('div', 'sub', 'search failed: ' + e.message));
+    }
+  }, 280);
+};
 
 $('#parseBtn').onclick = async () => {
   const text = $('#dump').value.trim();

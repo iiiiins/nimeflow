@@ -851,7 +851,26 @@ const FORMAT_VERSION = 1;
 const MAGIC = '#nimeflow-catalogue';
 
 // Row columns, in order. Kept as one list so serialise and parse cannot drift apart.
-const COLUMNS = ['id', 'kind', 'romaji', 'english', 'syn', 'year', 'format', 'country', 'popularity', 'cover'];
+// APPEND ONLY, and read by NAME out of the header rather than by position. Both halves of that
+// matter and each one buys a direction of compatibility.
+//
+// Appending means an older build reading a newer file still gets all ten columns it knows, because
+// their indices never move. Reading the header's own list means a newer build reading an older file
+// finds the columns that are there and treats the rest as absent, instead of skipping every row for
+// being one field short and reporting an empty index as a working one.
+//
+// That second direction was not hypothetical. `idmal` was added on 2026-08-02 while AniList was
+// returning 403 to everybody, so no catalogue could be rebuilt. Under the old positional reader the
+// deployed file would have parsed to zero rows the moment this list grew, and search would have
+// fallen back to the API that was down.
+//
+// `idmal` is MyAnimeList's id for the same work, which AniList hands over as `idMal`. Nothing reads
+// it yet. It is here so that a fallback metadata source stays reachable without another full
+// rebuild, which is a thing that can only be done while AniList is UP.
+const COLUMNS = ['id', 'kind', 'romaji', 'english', 'syn', 'year', 'format', 'country', 'popularity', 'cover', 'idmal'];
+
+// What a row cannot be read without. Everything outside this may be missing from an older file.
+const REQUIRED_COLUMNS = ['id', 'kind', 'romaji', 'english', 'syn', 'year', 'format', 'country', 'popularity', 'cover'];
 
 const KIND_ANIME = 0;
 const KIND_MANGA = 1;
@@ -946,6 +965,7 @@ function serialise(media, { builtAt = '', synonymCap = 2, covers = true } = {}) 
       m.countryOfOrigin || '',
       m.popularity || 0,
       covers ? coverFile(m.coverImage && m.coverImage.medium) : '',
+      m.idMal || '',
     ].join('\t'));
   }
   return `${lines.join('\n')}\n`;
@@ -978,24 +998,40 @@ function parse(text) {
     throw new Error(`catalogue format ${version}, this build reads ${FORMAT_VERSION}`);
   }
 
+  // The file says which columns it carries, in field 5 of its own header. Trusting that rather than
+  // this build's list is what lets the list grow without invalidating every catalogue already
+  // written. A file from before the header carried the list falls back to the ten that existed then.
+  const declared = (header[4] || '').split(',').filter(Boolean);
+  const cols = declared.length ? declared : REQUIRED_COLUMNS;
+  const at = new Map(cols.map((name, i) => [name, i]));
+
+  const missing = REQUIRED_COLUMNS.filter((name) => !at.has(name));
+  if (missing.length) {
+    // Loud, because the alternative is an index that reads as empty and looks like a working one.
+    throw new Error(`catalogue is missing ${missing.join(', ')}`);
+  }
+
   const rows = [];
   const lines = src.split('\n');
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
     if (!line) continue;
     const c = line.split('\t');
-    if (c.length < COLUMNS.length) continue;
+    if (c.length < cols.length) continue;
+    const f = (name) => (at.has(name) ? c[at.get(name)] : '');
     const row = {
-      id: Number(c[0]),
-      kind: Number(c[1]),
-      romaji: c[2],
-      english: c[3],
-      syn: c[4],
-      year: Number(c[5]) || null,
-      format: c[6] || null,
-      country: c[7] || null,
-      popularity: Number(c[8]) || 0,
-      cover: c[9] || '',
+      id: Number(f('id')),
+      kind: Number(f('kind')),
+      romaji: f('romaji'),
+      english: f('english'),
+      syn: f('syn'),
+      year: Number(f('year')) || null,
+      format: f('format') || null,
+      country: f('country') || null,
+      popularity: Number(f('popularity')) || 0,
+      cover: f('cover') || '',
+      // Absent on every catalogue built before 2026-08-02, and null is the honest reading of that.
+      idMal: Number(f('idmal')) || null,
     };
     row.hay = haystack(row.romaji, row.english, row.syn);
     rows.push(row);

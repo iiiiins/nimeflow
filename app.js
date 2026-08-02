@@ -81,22 +81,69 @@ function candidates(db) {
   return { forward, reverse };
 }
 
-async function sync(db) {
+// `deps.anilist` is a SEAM, for the same reason as the clock in lib/mangadex.js: what has to
+// change under test is the environment, not the logic. The SHAPE is the other one of the two,
+// and deliberately: mangadex installs a replacement at module scope with setTimers(), while this
+// is an optional last parameter, so a fake reaches one call and cannot outlive it. Optional and
+// last, so server.js and web-src/routes.js call this exactly as they did.
+async function sync(db, deps) {
+  const al = (deps && deps.anilist) || anilist;
   const { forward, reverse } = candidates(db);
 
   // Only the reverse direction needs enriching — colour is a tag, and tags are not on edges.
   const reverseIds = [...new Set(reverse.map((r) => r.id))];
-  const fetched = reverseIds.length ? await anilist.mediaByIds(reverseIds) : [];
+  const fetched = reverseIds.length ? await al.mediaByIds(reverseIds) : [];
   const byId = new Map(fetched.map((m) => [m.id, m]));
 
+  // One manga is one thing to read, however many seasons of the anime point at it. Two seasons
+  // of one show share a source, so the same manga was pushed once per season and reached the
+  // read list once per season. Measured on his library 2026-08-02: 62 reverse candidates carry
+  // 45 distinct sources, and 13 of those repeat, Attack on Titan four times. The ids were
+  // deduplicated above before the fetch; these rows were not.
+  //
+  // Every season that produced the row is kept in `sources`. "Which of my entries is this from"
+  // is the question the row exists to answer, and one arbitrarily chosen season is a worse
+  // answer than all of them. `from` and `fromTitle` stay as the first season, because server.js
+  // and web-src/routes.js both print them.
   const colourful = [];
+  const rowById = new Map();
   for (const r of reverse) {
     const m = byId.get(r.id);
     if (!m) continue;
     const tag = (m.tags || []).find((t) => t.name === COLOUR_TAG);
     const rank = tag ? tag.rank : 0;
     if (rank < COLOUR_THRESHOLD) continue;      // black-and-white: he is explicitly not interested
-    colourful.push({ ...r, fullColour: rank, country: m.countryOfOrigin, title: m.title.english || m.title.romaji });
+
+    const merged = rowById.get(r.id);
+    if (merged) { merged.sources.push({ from: r.from, fromTitle: r.fromTitle }); continue; }
+
+    const row = {
+      ...r,
+      sources: [{ from: r.from, fromTitle: r.fromTitle }],
+      fullColour: rank,
+      country: m.countryOfOrigin,
+      title: m.title.english || m.title.romaji,
+    };
+    rowById.set(r.id, row);
+    colourful.push(row);
+  }
+
+  // ONE ROW, EVERY SEASON THAT POINTS AT IT, IN AN ORDER THE LIBRARY CANNOT MOVE.
+  //
+  // Two seasons of one anime share a source manga, so the merge above is what stops it being
+  // offered twice. What the merge must not do is pick a spokesman: `row` is built from whichever
+  // candidate arrived first, and candidates arrive in db.entries order, so `fromTitle` was an
+  // answer to how the library happens to be stored. Measured on his library 2026-08-02: 13 of the
+  // 45 rows named a different season when db.entries was reversed, BLUE LOCK becoming BLUE LOCK
+  // Season 2 and One-Punch Man becoming One-Punch Man Season 3, with nothing else changed.
+  //
+  // Sorted by title then id, so the list is a function of its members. `fromTitle` stays the head
+  // of it for any reader that wants one name.
+  for (const row of colourful) {
+    row.sources.sort((a, b) => String(a.fromTitle).localeCompare(String(b.fromTitle))
+      || String(a.from).localeCompare(String(b.from)));
+    row.from = row.sources[0].from;
+    row.fromTitle = row.sources[0].fromTitle;
   }
 
   // Store on the DB rather than on entries — an adaptation belongs to the pair, not to one side.
@@ -104,7 +151,11 @@ async function sync(db) {
     toWatch: forward,
     toRead: colourful,
     checkedAt: new Date().toISOString(),
-    reverseChecked: reverse.length,
+    // DISTINCT sources, not edges. The page renders this as "of N sources checked" against a
+    // toRead count that has been distinct-by-source since the merge landed, so counting edges here
+    // put the two numbers on different bases and overstated the denominator by exactly the number
+    // of shared sources: 62 against 45 on his library.
+    reverseChecked: new Set(reverse.map((r) => r.id)).size,
     reverseColourful: colourful.length,
   };
   return db.adaptations;
@@ -381,16 +432,33 @@ async function searchPass(items, perPage, out, failed) {
   }
 }
 
+// Fetch media by id, and say so when AniList failed rather than when it had nothing.
+//
+// gql throws only when `json.errors && !json.data`. A GraphQL failure that answers HTTP 200 with
+// `data: { Page: null }` leaves data a non-null object, so nothing throws, `data.Page && …` yields
+// nothing, and the batch simply comes back short. A caller holding only the array cannot tell a
+// server-side failure from an id AniList does not have, which is how the Add tab told somebody
+// their title does not exist for a lookup that errored. Same fact failedAliases carries for the
+// batched search; this is the path that had no way to ask for it.
+//
+// The errors ride along as a non-enumerable property, for the same reason gql attaches them that
+// way: every caller that treats this as a plain array of media is unchanged, and one that needs to
+// tell a failure from an absence can ask. Unattributed on purpose: `id_in` is a single field, so an
+// error names the query and never the id inside it, which makes "some id in this batch failed" the
+// whole truth available.
 async function mediaByIds(ids) {
   const out = [];
+  const errors = [];
   const CHUNK = 40;
   for (let i = 0; i < ids.length; i += CHUNK) {
     const data = await gql(
       `query ($ids: [Int]) { Page(perPage: ${CHUNK}) { media(id_in: $ids) { ${MEDIA_FIELDS} } } }`,
       { ids: ids.slice(i, i + CHUNK) }
     );
+    errors.push(...((data && data.__errors) || []));
     out.push(...((data.Page && data.Page.media) || []));
   }
+  if (errors.length) Object.defineProperty(out, '__errors', { value: errors, enumerable: false, configurable: true });
   return out;
 }
 
@@ -1052,7 +1120,11 @@ function fromMedia(m) {
 // the most common reason a search looks broken. Then the catalogue, which answers instantly and
 // offline. AniList last, and only when the local answer is thin, because it is the slow, rate
 // limited, prefix-blind one.
-async function suggest({ term, entries = [], index = null, fetchApi = null, perKind = 6 }) {
+// `indexState` is what the CALLER knows about the index that it just passed as null, and only the
+// hosted build has anything to say: 'loading' while catalogue.tsv is still coming down, 'absent'
+// when it is genuinely not there. The desktop build reads the file off disk and passes nothing, so
+// it behaves exactly as it did before this argument existed.
+async function suggest({ term, entries = [], index = null, indexState = null, fetchApi = null, perKind = 6 }) {
   const q = String(term == null ? '' : term).trim();
   const mine = libraryMatches(entries, q);
   if (normalise(q).length < 2) return { q, results: [], mine, note: null, source: 'none' };
@@ -1070,6 +1142,30 @@ async function suggest({ term, entries = [], index = null, fetchApi = null, perK
   const strong = local.filter((r) => r.tier <= WORD_PREFIX).length;
   if (strong >= ENOUGH_LOCAL) {
     return { q, results: local, mine, note: null, source: 'catalogue' };
+  }
+
+  // THE INDEX IS COMING, SO DO NOT ASK ANILIST AND DO NOT WAIT FOR IT.
+  //
+  // Measured against the built site with catalogue.tsv held for 3 seconds and AniList refused:
+  // the client's own backoff retried at 282ms, 2.3s and 6.3s, and because the whole of this
+  // function is one await, the answer could not be drawn until that ladder finished. The index
+  // landed at 3.3s and had Frieren in it the whole time. Nine seconds in, the screen was still
+  // blank. The offline index exists so that search works without AniList, and it was sitting
+  // behind AniList.
+  //
+  // Answering now costs an online person a second: they get the index's answer when it lands
+  // rather than AniList's a little sooner. It saves an offline person a search that never
+  // arrives, and it spends none of the 22-per-minute AniList budget on a window where a better
+  // answer is already on its way. `retry` is what brings the page back.
+  if (!index && indexState === 'loading') {
+    return {
+      q,
+      results: [],
+      mine,
+      note: 'The offline index is still downloading. This will answer properly in a moment.',
+      source: mine.length ? 'library' : 'none',
+      retry: true,
+    };
   }
 
   let media = [];
@@ -1099,6 +1195,9 @@ async function suggest({ term, entries = [], index = null, fetchApi = null, perK
     : local.length ? 'catalogue'
       : fromApi.length ? 'anilist' : 'none';
 
+  // Nothing here handles an index that is still ARRIVING: that case returned above, before AniList
+  // was asked, and it is the only path that sets `retry`. A branch for it here would be dead, and
+  // this function had one for an hour, which is how a mutation of it survived and said so.
   let note = null;
   if (!results.length && !mine.length) {
     if (apiError) {
@@ -1106,12 +1205,14 @@ async function suggest({ term, entries = [], index = null, fetchApi = null, perK
     } else if (index) {
       note = 'No match in the offline catalogue or on AniList. Try a different spelling, or paste the title into the box below and confirm it by hand.';
     } else {
-      // The pre-catalogue message, kept for a build with no catalogue file. AniList's index needs
-      // most of a word: "frie" and "frier" return nothing while "friere" returns Frieren.
+      // The pre-catalogue message, kept for a build with no catalogue file. Absent is a working
+      // state and nothing is coming, so this one must NOT ask the page to come back. AniList's
+      // index needs most of a word: "frie" and "frier" return nothing while "friere" returns
+      // Frieren.
       note = 'AniList found nothing for that yet — its search needs most of a word. Try another letter or two.';
     }
   }
-  return { q, results, mine, note, source, apiError };
+  return { q, results, mine, note, source, apiError, retry: false };
 }
 
 module.exports = {
@@ -1810,6 +1911,30 @@ const SAME_WORK = new Set([
 //   SPIN_OFF   — same universe, different story. Kengan is not Baki.
 //   OTHER      — undefined by AniList; too loose to trust.
 
+// ONE CANONICAL ORDER for a franchise's members, and the unit's identity taken from its head.
+//
+// The identity used to be the union-find root, and that root is whichever member happened to be
+// walked first, so it was a function of db.entries order. Measured on his library on 2026-08-02:
+// reversing db.entries moved 11 of the 43 board rows onto a different id (Solo Leveling
+// anime-151807 to anime-176496, The Beginning After the End anime-183161 to manga-tbate), swapped
+// the cover art on 10 of the 11 franchises, and reordered the board's titles in 133 of the 389
+// prefixes of his comparison log. A tie-break on the unit id cannot repair any of that, because
+// the id was itself the moving part. An import, a re-sync or a re-add reorders db.entries.
+//
+// Shortest display title first, for the reason label() gives below: it lands on the root work
+// rather than on "Season 3 Part 2", so a row keeps season 1's cover and reads root-first. Equal
+// titles fall back to the title text and then to the entry id, so the head of the list is a
+// function of the member SET and of nothing else.
+//
+// The identity therefore stays a REAL member id, which is what DECISIONS.md requires: his stored
+// comparisons are re-read rather than rewritten, and the setting toggles both ways losing nothing.
+// A synthesised key would strand every answer he has already given.
+function byRootFirst(a, b) {
+  return a.meta.display.length - b.meta.display.length
+    || a.meta.display.localeCompare(b.meta.display)
+    || a.id.localeCompare(b.id);
+}
+
 function cluster(entries) {
   const parent = new Map();
   const find = (x) => { while (parent.get(x) !== x) x = parent.set(x, parent.get(parent.get(x))).get(x); return x; };
@@ -1837,7 +1962,16 @@ function cluster(entries) {
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k).push(e);
   }
-  return groups;
+
+  // Re-key every group on its own members. The union-find root above is only ever used to decide
+  // WHICH entries belong together, which is a connected component and does not depend on order.
+  // What the root must no longer decide is what the group is CALLED.
+  const byRoot = new Map();
+  for (const members of groups.values()) {
+    const ordered = members.slice().sort(byRootFirst);
+    byRoot.set(ordered[0].id, ordered);
+  }
+  return byRoot;
 }
 
 // A franchise's display identity: shortest title among its members, which reliably lands on
@@ -1856,18 +1990,20 @@ function cleanLabel(title) {
   return stripped.length >= 3 ? stripped : String(title);
 }
 
+// Both of these NAME A SET, so neither may read the order the set arrives in. The shortest title
+// was picked by a sort that is stable on ties, and the cover was simply the first member carrying
+// one, so both answered out of db.entries order. cluster() now hands over an ordered list and these
+// two would inherit that, but they are exported and the next caller need not be cluster.
 function label(members) {
-  const titles = members.map((m) => m.meta.display);
-  const shortest = titles.slice().sort((a, b) => a.length - b.length)[0];
-  return cleanLabel(shortest);
+  return cleanLabel(members.slice().sort(byRootFirst)[0].meta.display);
 }
 
 function cover(members) {
-  const withCover = members.filter((m) => m.meta.cover);
+  const withCover = members.filter((m) => m.meta.cover).sort(byRootFirst);
   return withCover.length ? withCover[0].meta.cover : null;
 }
 
-module.exports = { cluster, label, cleanLabel, cover, SAME_WORK };
+module.exports = { cluster, label, cleanLabel, cover, byRootFirst, SAME_WORK };
 };
 
 // ---- lib/linking.js ----------------------------------------------------------
@@ -2677,10 +2813,10 @@ function rankable(db) {
 // a specific season, and it could not do that on collapsed data. He asked for this "for rank
 // purposes specifically", which is exactly the right seam.
 //
-// Existing comparisons need no migration. A franchise key IS the id of one of its member
-// entries (the union-find root), so old entry-vs-entry comparisons map onto franchise pairs by
-// interpretation at replay time. Within-franchise comparisons become self-vs-self and are
-// dropped — 11 of his 301, so 96% of the work he already did survives the switch.
+// Existing comparisons need no migration. A franchise key IS the id of one of its member entries
+// (its root work, picked in lib/franchise.js), so old entry-vs-entry comparisons map onto
+// franchise pairs by interpretation at replay time. Within-franchise comparisons become
+// self-vs-self and are dropped — 11 of his 301, so 96% of the work he already did survives.
 // ---------------------------------------------------------------------------
 
 function units(db) {
@@ -2815,10 +2951,25 @@ function nextPair(db) {
   };
 }
 
+// Take exactly what computeRatings can replay: ANY member id, not only the one that names the unit
+// today. Accepting less than the replay understands meant a comparison about season 2 could be read
+// back forever and never made in the first place.
+//
+// And store the id he was given, unresolved. The log is the raw account of what was on screen, and
+// replay maps season to franchise when it reads. Writing the resolved id instead would freeze
+// today's naming member into the row; that member is only one entry like any other, so the day he
+// removes that season the answer he gave about a season he still owns resolves to nothing.
 function record(db, a, b, winner) {
   if (!db.comparisons) db.comparisons = [];
-  const valid = new Set(units(db).map((u) => u.id));
-  if (!valid.has(a) || !valid.has(b)) throw new Error('unknown ranking unit in comparison');
+  const key = unitKey(db);
+  const ua = key.get(a);
+  const ub = key.get(b);
+  if (!ua || !ub) throw new Error('unknown ranking unit in comparison');
+  // One franchise against itself. Measured on a two-season fixture: computeRatings drops the row
+  // at replay so the board stays empty, while the comparison total the pair screen shows him reads
+  // 1. And the row is only dormant. Turn rankByFranchise off and the two seasons become their own
+  // units, so it scores as an answer he was never asked for: 1528 against 1472.
+  if (ua === ub) throw new Error('both sides are the same ranking unit');
   if (winner !== null && winner !== a && winner !== b) throw new Error('winner must be one of the pair, or null for a tie');
   db.comparisons.push({ a, b, winner, at: new Date().toISOString() });
   return db.comparisons.length;
@@ -2864,7 +3015,11 @@ function leaderboard(db) {
         partTitles: u.members.map((m) => m.meta.display),
       };
     })
-    .sort((a, b) => b.rating - a.rating);
+    // Tied ratings break on id, the way nextPair already breaks its ties. Without it the board
+    // fell back to units(db) order, which is db.entries order, so an import or a re-add reshuffled
+    // every tied row without a single answer changing. Ties are the normal early state. The id
+    // order carries no meaning; being a function of the answers alone is the whole point.
+    .sort((a, b) => (b.rating - a.rating) || a.id.localeCompare(b.id));
 }
 
 module.exports = { computeRatings, derivedScores, nextPair, record, applyScores, leaderboard, rankable, units, unitKey };
@@ -3069,13 +3224,21 @@ const routes = {
   // comes from (a fetch here, a file there).
   //
   // catalogueWeb.get() never waits. On the first keystroke of a cold browser it returns null while
-  // the download runs, this falls through to AniList, and the search answers normally.
+  // the download runs and this falls through to AniList, which is right for a whole query and wrong
+  // for a partial one: AniList needs most of a word, so "frie" comes back empty and the answer used
+  // to be the message from before this index existed. Measured on the live site 2026-08-02, it
+  // appeared on the first search after opening the page and sat there unchanged for over three
+  // seconds, long after the file had landed, because nothing re-asked.
+  //
+  // So the STATE goes through as well. lib/catalogue.js says the index is arriving instead, and
+  // sets `retry` for the page to ask again. The keystroke still never waits on half a megabyte.
   'GET /api/suggest': async ({ query }) => {
     const db = store.load();
     const out = await catalogue.suggest({
       term: query.get('q') || '',
       entries: db.entries,
       index: catalogueWeb.get(),
+      indexState: catalogueWeb.status().state,
       fetchApi: (q) => anilist.suggest(q),
     });
     return { ...out, rate: anilist.rateInfo(), catalogue: catalogueWeb.status() };
@@ -3128,7 +3291,23 @@ const routes = {
     const { items } = body;
     if (!Array.isArray(items) || !items.length) throw new Error('nothing to commit');
 
-    const media = await anilist.mediaByIds([...new Set(items.map((i) => i.anilistId))]);
+    // "AniList has no such title" and "AniList did not answer" are different sentences, and the
+    // second one told as the first sends somebody off to re-check a spelling that was fine. Same
+    // distinction the parse step already draws. mediaByIds throws for the whole batch when the
+    // lookup fails, so catching it here is what lets every line say which of the two happened
+    // instead of the route becoming a 500 with no per-line account at all.
+    let media = [];
+    let lookupError = null;
+    try {
+      media = await anilist.mediaByIds([...new Set(items.map((i) => i.anilistId))]);
+      // A GraphQL failure that answers HTTP 200 does not throw: the batch comes back short and
+      // every id missing from it looks like an id AniList does not have. mediaByIds carries the
+      // errors so this route can tell the two apart on that path too.
+      const errors = media.__errors || [];
+      if (errors.length) lookupError = `AniList GraphQL: ${errors.map((e) => e.message).join('; ')}`;
+    } catch (err) {
+      lookupError = err.message;
+    }
     const byId = new Map(media.map((m) => [m.id, m]));
 
     // The library is read AFTER the fetch, and everything from here to save() is synchronous,
@@ -3136,9 +3315,24 @@ const routes = {
     // from hoisting its fetch, arrived at the same way — this is why the route needs no lock.
     const db = store.load();
     const added = [];
+    // Every line that did not land, named. The page used to be handed a count and had to subtract:
+    // paste eight, see six, and no word anywhere about which two were dropped or why.
+    const skipped = [];
     for (const it of items) {
       const m = byId.get(it.anilistId);
-      if (!m) continue;
+      if (!m) {
+        // No `raw` here. It was carried until 2026-08-02 and read by nothing: every skipped entry
+        // corresponds to an item the caller sent, so the caller already holds the line text and
+        // maps back by anilistId. The assertion that guarded it justified itself with a page
+        // behaviour that did not exist, which is the same shape as the `detail` field it sat next
+        // to, and that one was fixed by rendering it rather than by keeping it unread.
+        skipped.push({
+          anilistId: it.anilistId ?? null,
+          reason: lookupError ? 'anilist-error' : 'not-found',
+          detail: lookupError,
+        });
+        continue;
+      }
       const meta = store.fromAniList(m);
       // The format matters, not just the type: every other place in this codebase derives a
       // NOVEL from it, and filing a light novel as MANGA sends it down the chapter-tracking
@@ -3155,8 +3349,12 @@ const routes = {
       store.upsert(db, entry);
       added.push(entry.id);
     }
-    store.save(db);
-    return { added: added.length, ids: added, state: buildState() };
+    // Nothing resolved means nothing changed, and save() is not free of consequence: it stamps
+    // updatedAt and schedules a push. That stamp decides which device wins a two-device conflict,
+    // so a commit that added nothing could make this browser look newer than the phone that really
+    // did add something, and the phone's titles lose.
+    if (added.length) store.save(db);
+    return { added: added.length, ids: added, skipped, state: buildState() };
   },
 
   'POST /api/entry': async ({ body }) => {
@@ -3401,7 +3599,9 @@ const routes = {
       reverseChecked: result.reverseChecked,
       detail: {
         toWatch: result.toWatch.map((a) => `${a.fromTitle} -> ${a.title} (${a.status})`),
-        toRead: result.toRead.map((a) => `${a.fromTitle} -> ${a.title} (colour ${a.fullColour})`),
+        // Every season that points at this source, because one row can stand for several and
+        // naming only the first made the line an answer to how db.entries happens to be ordered.
+        toRead: result.toRead.map((a) => `${a.sources.map((s) => s.fromTitle).join(' + ')} -> ${a.title} (colour ${a.fullColour})`),
       },
       state: buildState(),
     };

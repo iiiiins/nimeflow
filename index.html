@@ -292,6 +292,15 @@ const showTab = (name) => { const b = $(`nav button[data-tab=${name}]`); if (b) 
 const STORE = BUNDLE ? BUNDLE.store : null;
 
 const STATUSES = ['CAUGHT_UP','COMPLETED','WATCHING','PAUSED','DROPPED','PLANNED'];
+
+// The two reasons POST /api/commit can give for dropping a confirmed line. Worded to match what
+// the parse step says about the same two facts one step earlier, because they ARE the same two
+// facts: AniList had nothing, or AniList did not answer. Reporting a failure as an absence tells
+// somebody their show does not exist and sends them off to re-check a spelling that was correct.
+const SKIP_REASON = {
+  'not-found': 'AniList had no title under that id, so nothing was written',
+  'anilist-error': 'AniList returned an error, so this line was not looked up. Try again in a moment.',
+};
 const KIND_LABEL = {
   NEXT_UP:['good','watch next'],
   ADAPTATION_ANIME:['good','you read it — anime exists'],
@@ -825,6 +834,25 @@ $('#findBox').oninput = () => {
       const r = await api('/api/suggest?q=' + encodeURIComponent(q));
       if (seq !== findSeq) return;   // a later keystroke already won
       renderFind(r);
+      // The offline index was still downloading when that answer was built, so it is provisional.
+      // Ask once more when the file has landed. Without this the very first search on a cold page
+      // keeps an empty result and a message about the index still arriving, indefinitely: nothing
+      // else re-runs the query and the person has no reason to type another character.
+      //
+      // Bounded, and it ends on its own: `retry` is only set while the index is LOADING, so the
+      // answer stops asking as soon as the file is parsed or has failed. One retry was not enough,
+      // because 590KB over a phone connection is seconds rather than one tick. Twenty attempts at
+      // 500ms is ten seconds, after which the honest answer is whatever the last one said.
+      let attempts = 0;
+      let latest = r;
+      while (latest.retry && attempts < 20) {
+        attempts++;
+        await new Promise((done) => setTimeout(done, 500));
+        if (seq !== findSeq) return;   // a later keystroke already won
+        latest = await api('/api/suggest?q=' + encodeURIComponent(q));
+        if (seq !== findSeq) return;
+        renderFind(latest);
+      }
     } catch (e) {
       if (seq !== findSeq) return;
       $('#findOut').innerHTML = '';
@@ -856,6 +884,16 @@ function renderParsed() {
     const pick = el('div'); pick.style.flex='1';
     pick.append(el('div','meta', item.raw));
 
+    // What the last Commit said about THIS line. The card is still here because the write did not
+    // take, and the two reasons want different things done: another candidate fixes an id AniList
+    // has nothing for, and nothing but waiting fixes an AniList that did not answer.
+    if (item.commitFailure) {
+      pick.append(el('div','flag', SKIP_REASON[item.commitFailure.reason] || item.commitFailure.reason));
+      // AniList's own words. Without them a rate limit and an outage are one sentence, and the
+      // advice attached to it ("try again in a moment") is right for only one of the two.
+      if (item.commitFailure.detail) pick.append(el('div','muted', item.commitFailure.detail));
+    }
+
     if (!item.candidates.length) {
       // A failed lookup and an absent title look identical from here unless the route says which.
       // Telling somebody their show does not exist when AniList simply errored sends them to
@@ -870,7 +908,11 @@ function renderParsed() {
         const o = el('option', null, `${c.title} — ${c.format||'?'} ${c.year||''} ${c.country}${c.alreadyHave?'  (already in library)':''}`);
         o.value = i; if (i === item.chosen) o.selected = true; sel.append(o);
       });
-      sel.onchange = () => { item.chosen = Number(sel.value); renderParsed(); };
+      // Picking a different candidate clears the last failure. The message says "AniList had no
+      // title under that id, so nothing was written", and choosing another id is the repair it
+      // asks for, so leaving the flag up makes the card assert a failure about a candidate that is
+      // no longer selected. It only cleared at the next commit before this.
+      sel.onchange = () => { item.chosen = Number(sel.value); item.commitFailure = null; renderParsed(); };
       pick.append(sel);
 
       const c = item.candidates[item.chosen ?? 0];
@@ -911,20 +953,44 @@ function renderParsed() {
     try {
       const r = await api('/api/commit', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ items }) });
       STATE = r.state; renderAll();
-      // Anything that did not match is put BACK in the box instead of vanishing with it.
+      // ONLY WHAT LANDED LEAVES THIS STEP.
       //
-      // Committing used to clear the textarea and the results together, so a 40-line paste
-      // where 6 titles failed left "added 34" and no record of which six — and the original
-      // text was gone too, so the only way to find out was retyping the list. The lines that
-      // failed are exactly the ones a person needs to fix and try again.
-      const unmatched = PARSED.filter((p) => !p.candidates.length).map((p) => p.raw);
-      const shortfall = items.length - r.added;
-      $('#dump').value = unmatched.join('\n');
-      $('#parseOut').innerHTML=''; PARSED=[];
+      // Committing used to clear the textarea and the cards together, so a 40-line paste where 6
+      // titles failed left "added 34", no record of which six, and no text to try again with.
+      // Naming the failures while still clearing the cards is the same loss wearing a smaller
+      // number: which of four candidates is the right one, what status each line is, and what
+      // episode he is on live in PARSED and nowhere else. The route never saw the lines it could
+      // not look up, so nothing can hand any of it back, and rebuilding it costs a fresh AniList
+      // search per line on the failure most likely to still be happening a second later.
+      //
+      // So a line leaves when it is in the library. The rest stay exactly as they were, each
+      // saying what happened to it, and pressing Commit again retries them with the picks intact.
+      const failed = new Map((r.skipped || []).map((s) => [s.anilistId, s]));
+      for (const p of PARSED) {
+        const c = p.candidates.length && p.chosen != null ? p.candidates[p.chosen] : null;
+        p.commitFailure = c ? (failed.get(c.anilistId) || null) : null;
+      }
+      // THE BOX AND THE CARDS HOLD DIFFERENT THINGS, because the two failures want different acts.
+      //
+      // A line nothing matched has no pick to correct, so the only way to retry it is to retype it,
+      // and it belongs in the box. A line that has candidates and failed to write is one press away
+      // from working, so it stays as a card with the choice and the numbers intact.
+      //
+      // Keeping unmatched lines as cards as well, which is what this did first, put every one of
+      // them on screen twice and left a button reading "Commit 0 entries" whose press raised
+      // "commit failed: nothing to commit". The note below already promised the split.
+      const unmatchedRaw = PARSED.filter((p) => !p.candidates.length).map((p) => p.raw);
+      PARSED = PARSED.filter((p) => p.commitFailure);
+      const unmatched = unmatchedRaw.length;
+      const retryable = PARSED.length;
+      $('#dump').value = unmatchedRaw.join('\n');
+      renderParsed();
       $('#parseNote').textContent = `added ${r.added}` +
-        (unmatched.length ? ` · ${unmatched.length} left in the box: nothing matched them, try a different spelling` : '') +
-        (shortfall > 0 && !unmatched.length ? ` · ${shortfall} could not be fetched and were skipped` : '');
-      $('#parseNote').style.color = (unmatched.length || shortfall > 0) ? 'var(--warn)' : '';
+        (unmatched ? ` · ${unmatched} left in the box: nothing matched them, try a different spelling` : '') +
+        (retryable ? ` · ${retryable} kept below with your choices, press Commit again to retry` : '');
+      // Warn on either kind of leftover. Reading PARSED.length alone stopped being right when the
+      // unmatched lines moved out of it and into the box, where they are just as unfinished.
+      $('#parseNote').style.color = (unmatched || retryable) ? 'var(--warn)' : '';
     } catch (e) { commit.disabled=false; commit.textContent='Commit'; alert('commit failed: ' + e.message); }
   };
   bar.append(commit);

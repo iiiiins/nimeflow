@@ -297,10 +297,22 @@ const STATUSES = ['CAUGHT_UP','COMPLETED','WATCHING','PAUSED','DROPPED','PLANNED
 // the parse step says about the same two facts one step earlier, because they ARE the same two
 // facts: AniList had nothing, or AniList did not answer. Reporting a failure as an absence tells
 // somebody their show does not exist and sends them off to re-check a spelling that was correct.
+// "Try again in a moment" was the advice here until 2026-08-02, when AniList disabled its own API
+// and the wait turned out to be open-ended. The honest version promises only what is true: the pick
+// and the numbers are still on the card, so pressing Commit again is all it takes whenever AniList
+// answers. It does not guess at when.
 const SKIP_REASON = {
   'not-found': 'AniList had no title under that id, so nothing was written',
-  'anilist-error': 'AniList returned an error, so this line was not looked up. Try again in a moment.',
+  'anilist-error': 'AniList did not answer, so this line was not looked up. Your choice is kept here: press Commit again once it does.',
 };
+
+// A browser cannot read a cross-origin response it was refused, so every server-side failure with
+// no CORS header on it arrives as this one string. AniList answering 403 with an explanation and a
+// dead connection are the same event from in here. Measured 2026-08-02: the API returned 403 with
+// "temporarily disabled due to severe stability issues" in the body, and the page saw only
+// "Failed to fetch". Saying which it was would be a guess; saying that it cannot be told apart is
+// not, and it stops somebody rebooting a router over an outage they cannot do anything about.
+const OPAQUE_FETCH = /failed to fetch|networkerror|load failed/i;
 const KIND_LABEL = {
   NEXT_UP:['good','watch next'],
   ADAPTATION_ANIME:['good','you read it — anime exists'],
@@ -890,8 +902,12 @@ function renderParsed() {
     if (item.commitFailure) {
       pick.append(el('div','flag', SKIP_REASON[item.commitFailure.reason] || item.commitFailure.reason));
       // AniList's own words. Without them a rate limit and an outage are one sentence, and the
-      // advice attached to it ("try again in a moment") is right for only one of the two.
-      if (item.commitFailure.detail) pick.append(el('div','muted', item.commitFailure.detail));
+      // advice attached to it is right for only one of the two.
+      if (item.commitFailure.detail) {
+        const opaque = OPAQUE_FETCH.test(item.commitFailure.detail);
+        pick.append(el('div', 'muted', item.commitFailure.detail
+          + (opaque ? '. That reads the same whether AniList is down or this device is offline: a browser is not allowed to see why a cross-origin request was refused.' : '')));
+      }
     }
 
     if (!item.candidates.length) {
@@ -899,8 +915,8 @@ function renderParsed() {
       // Telling somebody their show does not exist when AniList simply errored sends them to
       // re-check a spelling that was correct.
       pick.append(el('div','flag', item.lookupFailed
-        ? 'AniList returned an error for this line, so it was not looked up. Try again in a moment.'
-        : 'no match on AniList — skipped'));
+        ? 'AniList did not answer for this line, so it was not looked up. The line is still in the box above: press Parse again once it does.'
+        : 'no match on AniList, so this line was skipped'));
       item.chosen = null;
     } else {
       const sel = el('select'); sel.style.marginTop='6px'; sel.style.maxWidth='100%';

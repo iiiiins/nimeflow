@@ -1720,10 +1720,20 @@ function fit(db) {
   // is what keeps the dials, the weights, the blend and the residuals from disagreeing about it.
   //
   // Such an entry has an empty tag list, and `competence` (r = 0.568) and `agency` (r = 0.345),
-  // the two dials that predict this reader best, are computed from tag names carrying ranks.
-  // zscored() maps a missing value to 0, and 0 is the mean of a z-scored dial, so the entry reads
-  // as an ordinary average data point on both and pulls the model toward the middle. Held out, it
-  // costs a row. Left in, it corrupts every other row's weight.
+  // the two dials that predict this reader best, are computed from tag names carrying RANKS, which
+  // no other source publishes.
+  //
+  // THE REASON IS NOT THAT IT READS AS THE MEAN, and this comment said that until it was measured.
+  // The story went: a missing value z-scores to 0, 0 is the mean, so the entry looks average. Both
+  // of those dials always return a NUMBER, never null, so nothing is missing to begin with. Worse,
+  // MyAnimeList supplies genres and a synopsis, which those scorers also read. Measured with the
+  // real Jikan record for One Punch Man against the owner's library: competence lands at +0.507
+  // standard deviations and the overpowered dial at +1.064, both from a genre list and a paragraph
+  // of prose, with the tag ranks that carry most of the signal simply absent.
+  //
+  // So it is not a neutral row pulling the model to the middle. It is a CONFIDENT reading made from
+  // a third of the evidence, half a standard deviation off on the best dial, and it moves the
+  // weights as hard as a real row does. That is why it is held out rather than left in and diluted.
   //
   // The exclusion is per MEMBER, so a franchise whose manga is thin and whose two anime seasons
   // are complete is still fitted on the two that can answer. A unit with nothing left to read is
@@ -3955,11 +3965,14 @@ const routes = {
 
   // Pay off the entries that were added while AniList was down.
   //
-  // A MyAnimeList entry carries `tags: []`, and the two dials that predict this reader best read
-  // AniList tag NAMES WITH RANKS: competence at r = 0.568, agency at r = 0.345. lib/fit.js z-scores
-  // every dial, so a missing value becomes 0, which is the mean, so an unmarked partial entry would
-  // not score low, it would pretend to be an ordinary average data point. lib/fit.js therefore
-  // holds them out entirely, and they stay out until this route runs. A partial entry is a debt.
+  // A MyAnimeList entry carries `tags: []`, and the two dials that predict this reader best are
+  // computed from tag names carrying ranks, which no other source publishes. lib/fit.js holds such
+  // an entry out entirely, and it stays out until this route runs. A partial entry is a debt.
+  //
+  // Measured rather than reasoned, and the first version of this comment had it wrong: such an
+  // entry does not read as the MEAN. MyAnimeList supplies genres and a synopsis, which those dials
+  // also read, so it lands +0.507 SD off on competence from a third of the evidence. A confident
+  // wrong row rather than a neutral one, which is why it is held out instead of diluted.
   //
   // Triggered by an action and never by a clock. The page calls it after a commit that reached
   // AniList, and the Library tab has a button for somebody who does not want to wait for one.
@@ -4685,9 +4698,17 @@ function fromAniList(media) {
 // graphql.anilist.co answered 403 to everybody on 2026-08-02 and a commit had nowhere to fetch
 // from.
 //
-// The marker is what lib/fit.js holds out on. Nothing else in the app treats a partial entry
-// differently: it displays, ranks and filters like any other, because the fields those read are
-// the ones MyAnimeList can supply.
+// The marker is what lib/fit.js holds out on. A partial entry displays and ranks like any other,
+// because the fields those read are the ones MyAnimeList can supply.
+//
+// FILTERING IS THE EXCEPTION, and this comment claimed otherwise until it was checked. The age
+// filter in lib/taste.js reads tag RANKS through maxRankIn, so an empty tag list makes every young
+// signal read 0 and the verdict comes back PASS unconditionally. Measured: Sword Art Online from
+// the owner's real library returns FAIL for children carrying world-scale stakes, and the same show
+// rebuilt through mal.fromJikan returns PASS. No live path reaches it today, because applyFilters
+// only ever sees candidates built by fromAniList, so this is a hazard rather than a wrong answer.
+// A future caller that filters library entries has to hold partial ones out the way lib/fit.js
+// does, or it will wave through exactly what the filter exists to catch.
 //
 // A backfill hands upsert a complete meta object, which REPLACES the stored one whole, so the
 // marker leaves with the object it was written on and nobody has to remember to clear it.

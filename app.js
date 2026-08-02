@@ -1091,11 +1091,17 @@ function search(index, term, { perKind = 6, exclude = null } = {}) {
 // and averageScore are per-title state that would be stale the day after the catalogue was built,
 // and a stale "12 episodes" is the class of confident wrong number this project exists to avoid.
 // They arrive with the real fetch at commit time.
+//
+// `malId` is the exception, and it is here because of what happened on 2026-08-02: AniList answered
+// 403 to everybody, so the real fetch had nowhere to go and the owner could not add a title at all.
+// MyAnimeList through Jikan is the fallback source, and it is reachable only by MyAnimeList's own
+// id. An id is not per-title state and cannot go stale the way a chapter count does.
 function toSuggestion(row) {
   const medium = row.kind === KIND_MANGA ? (row.format === 'NOVEL' ? 'NOVEL' : 'MANGA') : 'ANIME';
   return {
     id: `${medium.toLowerCase()}-${row.id}`,
     anilistId: row.id,
+    malId: row.idMal || null,
     medium,
     title: row.english || row.romaji,
     cover: coverUrl(row.cover, row.kind),
@@ -1664,6 +1670,7 @@ __modules["fit"] = function (module, exports, require) {
 // --replay and --seasons work, and this function neither knows nor cares.
 
 const rank = require('./rank');
+const storeCore = require('./store-core');
 const { AXES, pearson } = require('./axes');
 
 const BLENDABLE = AXES.filter((a) => !a.excludeFromBlend);
@@ -1708,12 +1715,31 @@ function blend(subset, weights) {
 
 function fit(db) {
   const unitById = new Map(rank.units(db).map((u) => [u.id, u]));
-  const rows = rank.leaderboard(db).map((r) => ({
+
+  // A title whose metadata came from MyAnimeList is dropped here, and dropping it once at the top
+  // is what keeps the dials, the weights, the blend and the residuals from disagreeing about it.
+  //
+  // Such an entry has an empty tag list, and `competence` (r = 0.568) and `agency` (r = 0.345),
+  // the two dials that predict this reader best, are computed from tag names carrying ranks.
+  // zscored() maps a missing value to 0, and 0 is the mean of a z-scored dial, so the entry reads
+  // as an ordinary average data point on both and pulls the model toward the middle. Held out, it
+  // costs a row. Left in, it corrupts every other row's weight.
+  //
+  // The exclusion is per MEMBER, so a franchise whose manga is thin and whose two anime seasons
+  // are complete is still fitted on the two that can answer. A unit with nothing left to read is
+  // reported as partialUnits rather than silently shortening the count.
+  //
+  // It rejoins the moment a backfill replaces its meta. Partial entries became possible on
+  // 2026-08-02, when AniList began answering 403 and the commit path fell back to Jikan.
+  const listed = rank.leaderboard(db).map((r) => ({
     id: r.id,
     title: r.title,
     his: r.score,
-    members: (unitById.get(r.id) || { members: [] }).members,
+    members: (unitById.get(r.id) || { members: [] }).members
+      .filter((m) => !storeCore.isPartial(m.meta)),
   }));
+  const rows = listed.filter((r) => r.members.length);
+  const partialUnits = listed.length - rows.length;
 
   const dials = AXES.map((axis) => {
     const pairs = rows.map((r) => ({ v: axisValue(axis, r), his: r.his })).filter((p) => p.v !== null && p.his !== null);
@@ -1754,6 +1780,9 @@ function fit(db) {
   return {
     units: rows.length,
     scoredUnits: scored.length,
+    // Ranked units held out for want of AniList metadata. Reported so a shrunken `units` has a
+    // reason attached to it rather than looking like titles going missing.
+    partialUnits,
     comparisons: (db.comparisons || []).length,
     perFranchise: !!db.settings.rankByFranchise,
     dials,
@@ -2165,6 +2194,412 @@ async function linkAll(db, { onProgress, only } = {}) {
 }
 
 module.exports = { linkAll, candidatesFor, linkable, isReading, CONFIDENT };
+};
+
+// ---- lib/mal.js --------------------------------------------------------------
+__modules["mal"] = function (module, exports, require) {
+'use strict';
+
+// MyAnimeList metadata, through the Jikan API. The fallback for the day AniList stops answering.
+//
+// It happened on 2026-08-02: graphql.anilist.co returned 403 to everybody with "The AniList API has
+// been temporarily disabled due to severe stability issues", and the owner could not add a single
+// title. Search kept working, because this app carries its own offline title index, but committing
+// an entry needs a real metadata fetch and there was nowhere to fetch from.
+//
+// Jikan is MyAnimeList's read-only mirror: free, no key, and it answers with
+// Access-Control-Allow-Origin: *, which is why the browser build can call it directly and needs no
+// proxy of the kind lib/mangadex.js required. That header is also why it was chosen over Kitsu,
+// which answers 200 and sends no CORS header at all.
+//
+// WHAT THIS SOURCE CANNOT DO, and it shapes everything below. The two dials that predict this user
+// best both read AniList tag NAMES WITH RANKS: competence at r = 0.568 filters tags at rank 45 and
+// above, agency at r = 0.345 weights specific names. MyAnimeList has genres, themes and
+// demographics and none of them carry a rank, so an entry built here gets `tags: []` and is marked
+// `partial`. That marker is the point of the file, not a footnote: lib/fit.js z-scores every dial,
+// so a missing value becomes 0, which is the MEAN. An unmarked partial entry would not score low,
+// it would pretend to be an ordinary average data point and drag the model toward the middle.
+
+const ENDPOINT = 'https://api.jikan.moe/v4';
+
+// Jikan documents 3 requests a second and 60 a minute. Both are enforced, because they bite in
+// different ways: 45 requests fired inside one second satisfies the per-minute ceiling and breaks
+// the per-second one, and a 400ms gap alone would allow 150 a minute. So this file carries the two
+// shapes the other two clients already use, one per documented limit: lib/mangadex.js spaces
+// consecutive requests, lib/anilist.js caps a rolling window, and neither is a new invention.
+const MAX_PER_MIN = 60;        // Jikan's documented per-minute ceiling
+const SELF_PER_MIN = 45;       // this client's own cap, the way lib/anilist.js sits at 22 under 30
+const MIN_GAP_MS = 400;        // 2.5 requests a second, under the documented 3
+const WINDOW_MS = 60_000;
+
+// Measured 2026-08-02 over 8 cold ids spaced 1.5s apart: 6 answered 200, one returned HTTP 504
+// with "Jikan failed to connect to MyAnimeList" and one "Request to MyAnimeList.net timed out".
+// MyAnimeList's own site answered 200 throughout, so the broken link is Jikan's to MAL and it is
+// intermittent. A client that does not retry fails about a quarter of the time on that day.
+const MAX_ATTEMPTS = 3;
+
+// A caller has to tell "MyAnimeList has no such id" from "nobody could be asked", the same
+// distinction lib/mangadex.js carries codes for. The first is a dead catalogue row, the second is a
+// wait, and the Add flow says different things about them.
+function fail(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+// The clock is a SEAM, in the same shape and for the same reason as lib/mangadex.js setTimers: the
+// waits below are real in production and hard constraint 8 is why, but a test that never opens a
+// socket is not rate limiting anything and must not pay for the waits. Called with no argument it
+// restores the real clock, so a test cannot leave a no-op sleep behind for whatever runs next.
+let sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function sleep(ms) { return sleepImpl(ms); }
+
+function setTimers(timers) {
+  sleepImpl = (timers && typeof timers.sleep === 'function')
+    ? timers.sleep
+    : (ms) => new Promise((r) => setTimeout(r, ms));
+}
+
+// The network is a seam too, so a test can drive a 504 without one. Resolved at call time rather
+// than captured, so replacing globalThis.fetch also works.
+let fetchImpl = null;
+
+function setFetch(fn) { fetchImpl = typeof fn === 'function' ? fn : null; }
+
+function doFetch(url, opts) { return (fetchImpl || globalThis.fetch)(url, opts); }
+
+// Request times are PLANNED rather than measured after the fact. Reading the clock in a loop, the
+// way lib/anilist.js does, spins forever under an injected sleep that resolves immediately, because
+// the clock never moves. Planning the slot means the arithmetic is the same whoever is holding the
+// clock, and the decision to wait is still recorded as a real sleep the test can read.
+let nextAt = 0;
+const planned = [];
+
+async function throttle() {
+  const now = Date.now();
+  while (planned.length && now - planned[0] > WINDOW_MS) planned.shift();
+
+  let at = Math.max(now, nextAt);
+  if (planned.length >= SELF_PER_MIN) {
+    // The oldest request that still counts against the cap has to leave the window first.
+    at = Math.max(at, planned[planned.length - SELF_PER_MIN] + WINDOW_MS + 250);
+  }
+
+  const wait = at - now;
+  if (wait > 0) await sleep(wait);
+  nextAt = at + MIN_GAP_MS;
+  planned.push(at);
+}
+
+// One GET. Returns the Jikan `data` object, or null when MyAnimeList genuinely has no such id.
+// Throws when the question could not be asked.
+async function request(path, attempt = 0) {
+  await throttle();
+
+  let res;
+  try {
+    res = await doFetch(ENDPOINT + path, {
+      // Without this a stalled connection sits on undici's five-minute header timeout and the
+      // retries stack on top of it, which is how the Add flow froze with a disabled button and no
+      // error the first time it happened against AniList.
+      signal: AbortSignal.timeout(20000),
+      // No User-Agent. The browser build calls Jikan directly and User-Agent is a forbidden header
+      // there, so a client that depended on one would behave differently in the two builds.
+      headers: { Accept: 'application/json' },
+    });
+  } catch (err) {
+    if (attempt + 1 < MAX_ATTEMPTS) {
+      await sleep(1500 * (attempt + 1));
+      return request(path, attempt + 1);
+    }
+    throw fail('MAL_UNREACHABLE', `Jikan unreachable: ${err.message}`);
+  }
+
+  // A GENUINE ABSENCE, and it is never retried. Retrying a 404 spends the budget of a client that
+  // is already rate limited to answer a question MyAnimeList has settled.
+  if (res.status === 404) return null;
+
+  if (res.status === 429) {
+    if (attempt + 1 >= MAX_ATTEMPTS) throw fail('MAL_RATE_LIMITED', 'Jikan rate limited, gave up');
+    await sleep(Number(res.headers.get('retry-after') || 30) * 1000 + 2000);
+    return request(path, attempt + 1);
+  }
+
+  // The measured failure. Both shapes seen on 2026-08-02 arrive as a 5xx carrying Jikan's own
+  // BadResponseException, and both mean Jikan could not reach MyAnimeList rather than that the id
+  // is wrong. 408 is here because a timeout reported as a client timeout is the same upstream
+  // stall wearing a different number.
+  if (res.status >= 500 || res.status === 408) {
+    if (attempt + 1 < MAX_ATTEMPTS) {
+      await sleep(2000 * (attempt + 1));
+      return request(path, attempt + 1);
+    }
+    throw fail('MAL_HTTP', `Jikan ${res.status} for ${path}`);
+  }
+
+  if (!res.ok) {
+    throw fail('MAL_HTTP', `Jikan HTTP ${res.status} for ${path}: ${(await res.text()).slice(0, 160)}`);
+  }
+
+  // A 200 carrying something that is not Jikan's JSON is the dangerous answer, for the reason
+  // lib/mangadex.js spells out: read leniently it becomes an entry with no title and no counts,
+  // written to the library as fact. A captive portal and a proxy error page both answer 200.
+  let json;
+  try {
+    json = await res.json();
+  } catch (err) {
+    throw fail('MAL_BAD_RESPONSE', `Jikan sent no JSON for ${path}: ${err.message}`);
+  }
+  if (!json || typeof json.data !== 'object' || json.data === null) {
+    throw fail('MAL_BAD_RESPONSE', `Jikan returned no data for ${path}`);
+  }
+  return json.data;
+}
+
+// Look a title up by its MyAnimeList id.
+//
+// NOVEL asks the manga endpoint, because MyAnimeList files light novels under manga and there is no
+// novel endpoint to ask.
+//
+// /full FIRST, then plain. Only /full carries `relations`, which is what lib/franchise.js clusters
+// on and lib/adaptations.js reads. /full is also measurably likelier to fail: on 2026-08-02
+// manga/13 answered 200 while manga/13/full failed six attempts in a row. Failing the whole lookup
+// because the richer variant is sick would leave the Add flow exactly as stuck as AniList's 403 left
+// it, so the plain endpoint is asked next and the result says which one served.
+async function byId(malId, medium) {
+  const id = Number(malId);
+  if (!(id > 0)) throw fail('MAL_BAD_ID', `not a MyAnimeList id: ${JSON.stringify(malId)}`);
+  const kind = medium === 'ANIME' ? 'anime' : 'manga';
+
+  try {
+    return await request(`/${kind}/${id}/full`);
+  } catch (err) {
+    // Only when Jikan ANSWERED badly. Being rate limited or being unable to reach the host says
+    // nothing about the variant, and asking a second path would persist through a rate limit for
+    // no prospect of an answer, which is the behaviour hard constraint 8 exists to forbid.
+    if (err.code !== 'MAL_HTTP' && err.code !== 'MAL_BAD_RESPONSE') throw err;
+    return request(`/${kind}/${id}`);
+  }
+}
+
+// --- vocabulary ---------------------------------------------------------------------------------
+//
+// Jikan and AniList name the same facts differently, and everything downstream reads AniList's
+// spelling. Translating is the whole job of this half of the file; passing a value through
+// unchanged is how a wrong answer gets stored as fact.
+
+// lib/extent.js reads RELEASING and NOT_YET_RELEASED, lib/taste.js owed() reads RELEASING for the
+// "still going, no number to be behind by" card and gates sequels on FINISHED as well.
+const ANIME_STATUS = {
+  'Finished Airing': 'FINISHED',
+  'Currently Airing': 'RELEASING',
+  'Not yet aired': 'NOT_YET_RELEASED',
+};
+
+const MANGA_STATUS = {
+  Finished: 'FINISHED',
+  Publishing: 'RELEASING',
+  'On Hiatus': 'HIATUS',
+  Discontinued: 'CANCELLED',
+  'Not yet published': 'NOT_YET_RELEASED',
+};
+
+// isStandalone in lib/store-core.js reads format and decides whether a title is excluded from
+// ranking, so a wrong mapping quietly changes which pairs the owner is asked to compare. A Special
+// left unmapped would be ranked against four-season runs; a Manhwa left unmapped would lose the
+// MANGA branch in lib/extent.js and be measured in episodes.
+//
+// TV_SHORT has no MyAnimeList equivalent: MAL files shorts as TV, and inventing the distinction
+// here would be guessing.
+const FORMAT = {
+  TV: 'TV',
+  Movie: 'MOVIE',
+  OVA: 'OVA',
+  ONA: 'ONA',
+  Special: 'SPECIAL',
+  'TV Special': 'SPECIAL',
+  Music: 'MUSIC',
+  Manga: 'MANGA',
+  Manhwa: 'MANGA',
+  Manhua: 'MANGA',
+  Doujinshi: 'MANGA',
+  'Light Novel': 'NOVEL',
+  Novel: 'NOVEL',
+  'One-shot': 'ONE_SHOT',
+};
+
+// The only country MyAnimeList states. Its manga `type` is the publication tradition, and Manhwa
+// and Manhua name Korea and China outright, so reading them is a translation rather than a guess.
+// Everything else stays null, including "Manga": DECISIONS.md keys a whole filter on this field
+// (lib/taste.js flags Chinese-origin titles as playable only with a good dub), and a guessed
+// country is worse than an absent one there.
+const COUNTRY_BY_TYPE = { Manhwa: 'KR', Manhua: 'CN' };
+
+function startYear(data) {
+  const span = data.aired || data.published;
+  const from = span && span.prop && span.prop.from;
+  return (from && from.year) || null;
+}
+
+// Collapse a Jikan record into the same shape lib/store-core.js fromAniList returns, so every
+// reader of entry.meta is unchanged.
+//
+// anilistId is an ARGUMENT because the flow starts from a catalogue row that already knows both
+// ids, and the entry id is `${medium}-${anilistId}`. Inventing one, or leaving it undefined, makes
+// an entry a later backfill cannot land on: it would write a second row rather than replace this
+// one. So a missing id is a throw rather than a default.
+function fromJikan(data, medium, anilistId) {
+  if (!data || typeof data !== 'object') {
+    throw fail('MAL_BAD_RESPONSE', 'fromJikan was handed no record to read');
+  }
+  if (!(Number(anilistId) > 0)) {
+    throw fail('MAL_NO_ANILIST_ID',
+      'fromJikan needs the AniList id its catalogue row already holds: the entry id is '
+      + `${String(medium).toLowerCase()}-<anilistId>, and a backfill would otherwise create a `
+      + 'second entry beside this one instead of replacing it');
+  }
+
+  const anime = medium === 'ANIME';
+  const statuses = anime ? ANIME_STATUS : MANGA_STATUS;
+
+  return {
+    anilistId: Number(anilistId),
+    malId: data.mal_id || null,
+    title: {
+      romaji: data.title || null,
+      english: data.title_english || null,
+      native: data.title_japanese || null,
+    },
+    display: data.title_english || data.title || data.title_japanese || 'Untitled',
+    // AniList files light novels as MANGA with format NOVEL, and lib/extent.js branches on this.
+    type: anime ? 'ANIME' : 'MANGA',
+    format: FORMAT[data.type] || null,
+    releaseStatus: statuses[data.status] || null,
+    countryOfOrigin: COUNTRY_BY_TYPE[data.type] || null,
+    // MyAnimeList marks adult work two ways and both are read: explicit_genres carries Hentai and
+    // Erotica, and the anime age rating "Rx - Hentai" is not a genre at all. "R - 17+" is neither.
+    isAdult: ((data.explicit_genres || []).length > 0) || String(data.rating || '').startsWith('Rx'),
+    // Anime carry a `year`; manga carry only a publication span, so the start year is read out of
+    // it. This is one field where a backfill from AniList may CHANGE the display, since AniList
+    // leaves seasonYear null on most manga. A visible start year is worth that.
+    seasonYear: data.year || startYear(data),
+    // Episodes for anime, chapters for manga, and null stays null. Hard constraint 3: an ongoing
+    // series has no count, and One Piece answers chapters: null for exactly that reason.
+    totalUnits: (anime ? data.episodes : data.chapters) ?? null,
+    volumes: anime ? null : (data.volumes ?? null),
+    // Jikan scores 0 to 10 with a decimal and every consumer assumes AniList's 0 to 100, including
+    // the crowd dial in lib/axes.js. 8.47 is 85, not 8.
+    averageScore: typeof data.score === 'number' ? Math.round(data.score * 10) : null,
+    // AniList popularity is the number of users holding the title, which is MyAnimeList's
+    // `members`. Jikan's own `popularity` field is a RANK, so One Punch Man reads 4 there and
+    // 3,540,490 here, and lib/catalogue.js breaks ties on this number descending.
+    popularity: typeof data.members === 'number' ? data.members : null,
+    genres: (data.genres || []).map((g) => g.name).filter(Boolean),
+    // EMPTY ON PURPOSE, and the reason is at the top of this file. MyAnimeList's themes and
+    // demographics have no rank, and lib/taste.js reads `t.rank` on every tag. Handing them a
+    // made-up rank would feed the two best dials invented numbers.
+    tags: [],
+    description: data.synopsis || '',
+    cover: (data.images && data.images.jpg
+      && (data.images.jpg.large_image_url || data.images.jpg.image_url)) || null,
+    // MyAnimeList publishes a broadcast slot, never a next episode number. lib/taste.js falls
+    // through to the honest "still releasing, no number to be behind by" card without one.
+    nextAiringEpisode: null,
+
+    // RELATIONS ARE DROPPED, and this is the one field where the honest answer is nothing.
+    //
+    // lib/franchise.js unions works by ANILIST id, comparing relation ids against other entries'
+    // anilistId. MyAnimeList numbers the same works differently: One-Punch Man is AniList 21087 and
+    // MAL 30276, its manga is AniList 74347 and MAL 44347, its season 2 is AniList 97668 and MAL
+    // 34134. Every one of those MAL numbers is a plausible AniList id belonging to some other work,
+    // so writing them here would union unrelated franchises. lib/taste.js owed() is worse: it
+    // pushes `sequelId` straight into db.dismissed, which is a list of AniList ids, so one wave-off
+    // would permanently hide whatever really holds that number.
+    relations: [],
+    // What MyAnimeList said, kept unrenamed so nobody mistakes it for the AniList shape. null means
+    // the plain endpoint served and relations were never seen at all, which is not the same fact as
+    // a title that genuinely has none.
+    malRelations: Array.isArray(data.relations)
+      ? data.relations.flatMap((r) => (r.entry || []).map((e) => ({
+        relation: r.relation, malId: e.mal_id, type: e.type, name: e.name,
+      })))
+      : null,
+
+    // THE MARKER. fromAniList sets neither, which is what makes a backfill a plain wholesale
+    // replacement of meta: the new object simply has no marker on it. Anything that fits or ranks
+    // taste must exclude these until then.
+    partial: true,
+    partialFrom: 'myanimelist',
+    cachedAt: new Date().toISOString(),
+  };
+}
+
+// Shaped like lib/anilist.js rateInfo(). `remaining` counts against this client's own cap rather
+// than Jikan's, because the self-cap is the one that is actually enforced here.
+function rateInfo() {
+  const now = Date.now();
+  const recent = planned.filter((t) => now - t < WINDOW_MS);
+  return {
+    remaining: Math.max(0, SELF_PER_MIN - recent.length),
+    resetsIn: recent.length ? Math.max(0, recent[0] + WINDOW_MS - now) : 0,
+    usedThisMinute: recent.length,
+    selfCap: SELF_PER_MIN,
+    documentedCap: MAX_PER_MIN,
+  };
+}
+
+// How long a commit may spend here before it gives up and hands back what it has.
+//
+// The pre-pass was unbounded first, in the route whose sibling repair pass is bounded at 40 items
+// for exactly this reason. Measured on a real desktop server with an instantly-answering stub: 1
+// line 12ms, 5 lines 2.0s, 20 lines 8.0s, which is MIN_GAP_MS doing its job. The real number is far
+// worse, because Jikan failed about a quarter of the time on 2026-08-02 and a failing id costs up
+// to three attempts of a 20 second timeout plus backoffs, so ONE bad line in a paste is about a
+// minute on a single HTTP request. web/index.html's api() sets no timeout, so the Commit button
+// sits disabled with nothing on screen for all of it.
+//
+// A budget rather than an item cap, because the thing that hurts is not how many lines there are.
+// It is one line that will not answer. Whatever is not reached comes back unattempted, and the
+// person's picks are already kept on their cards, so pressing Commit again continues where this
+// stopped.
+const FALLBACK_BUDGET_MS = 12_000;
+
+// Resolve a batch through MyAnimeList, in lib/ because BOTH builds do it and hard constraint 9 says
+// shared logic lives here rather than in two copies of a route.
+//
+// `now` is injectable for the same reason the clock is: a test that drives the budget must not wait
+// out twelve real seconds to see it work.
+async function resolveMany(items, { budgetMs = FALLBACK_BUDGET_MS, now = () => Date.now() } = {}) {
+  const resolved = new Map();
+  const deadline = now() + budgetMs;
+  const unattempted = [];
+
+  for (const it of items || []) {
+    if (!it || resolved.has(it.anilistId)) continue;
+    // No MyAnimeList id is the ordinary case on every catalogue built before 2026-08-02, and it is
+    // not a failure worth reporting: the line simply has nowhere else to go.
+    if (!it.malId || !it.medium || !(it.anilistId > 0)) continue;
+
+    if (now() >= deadline) { unattempted.push(it.anilistId); continue; }
+
+    try {
+      const data = await byId(it.malId, it.medium);
+      resolved.set(it.anilistId, data
+        ? { meta: fromJikan(data, it.medium, it.anilistId) }
+        : { error: `MyAnimeList has nothing under id ${it.malId}` });
+    } catch (err) {
+      resolved.set(it.anilistId, { error: err.message });
+    }
+  }
+  return { resolved, unattempted };
+}
+
+module.exports = {
+  byId, fromJikan, rateInfo, setTimers, setFetch, resolveMany,
+  MAX_PER_MIN, SELF_PER_MIN, MIN_GAP_MS, ENDPOINT, FORMAT, ANIME_STATUS, MANGA_STATUS,
+  FALLBACK_BUDGET_MS,
+};
 };
 
 // ---- lib/mangadex.js ---------------------------------------------------------
@@ -3081,7 +3516,11 @@ __modules["routes"] = function (module, exports, require) {
 // is the same class of bug that lib/store-core.js exists to prevent.
 
 const anilist = require('../lib/anilist');
+const mal = require('../lib/mal');
 const store = require('./store-web');
+// Neither store re-exports this one, and both would have to. Required from the file that owns the
+// library shape instead, which is where every other reader of the marker gets it.
+const { isPartial } = require('../lib/store-core');
 const taste = require('../lib/taste');
 const rank = require('../lib/rank');
 const chapters = require('../lib/chapters');
@@ -3099,6 +3538,12 @@ const catalogueWeb = require('./catalogue-web');
 // title -> {chapters,status,matched} or null for a known miss. Page-lifetime only: a reload
 // re-checks, which is the right cadence for a number that changes when a series does.
 const chapterCountCache = new Map();
+
+// How many titles one repair pass asks AniList about. lib/anilist.js self-throttles at 22 requests
+// a minute (hard constraint 8), so an unbounded pass over a large library would leave the page
+// waiting for minutes with nothing on screen. The reply says how many are left, and pressing again
+// takes the next batch. Both builds carry this number; server.js holds the other copy.
+const BACKFILL_BATCH = 40;
 
 // --- state ------------------------------------------------------------------
 
@@ -3120,6 +3565,10 @@ function buildState() {
         nostalgia: !!e.nostalgia,
         standalone: !!e.standalone, verdict: e.verdict || null, format: e.meta.format || null,
         mangadexId: e.mangadexId || null,
+        // Its metadata came from MyAnimeList, so it carries no tag ranks and lib/fit.js holds it
+        // out of the taste fit. The page says so on the row rather than letting a title sit
+        // invisible to Discover with nothing on screen explaining why.
+        partial: isPartial(e.meta),
         chapters: e.chapters
           ? { latest: e.chapters.latest, source: e.chapters.source, hostedCount: e.chapters.hostedCount,
               confidence: chapters.confidence(e, new Date().toISOString()) }
@@ -3199,6 +3648,10 @@ const routes = {
       blend: r.blend,
       units: r.units,
       scoredUnits: r.scoredUnits,
+      // Ranked titles lib/fit.js held out for want of AniList tag ranks. Carried so a shrunken
+      // `units` arrives with its reason attached rather than looking like titles going missing,
+      // both in the file and in the line the page prints when it is downloaded.
+      partialUnits: r.partialUnits,
       comparisons: r.comparisons,
       perFranchise: r.perFranchise,
       // 12 is enough to see a pattern and few enough that the file stays readable by a person.
@@ -3289,10 +3742,25 @@ const routes = {
     if (parsed.length > 120) throw new Error('more than 120 lines at once — split it up, the API is rate limited');
 
     const queries = parsed.map((p, i) => ({ key: `k${i}`, term: p.title, mediaType: p.guess.medium === 'ANIME' ? 'ANIME' : 'MANGA' }));
-    const hits = await anilist.searchMany(queries, 4);
+    // A TOTAL FAILURE IS NOT AN EXCEPTION HERE, it is the outage case.
+    //
+    // searchMany marks individual lines in __errored when SOME aliases fail, and throws when the
+    // whole request does. On 2026-08-02 AniList answered 403 to every request, so it threw, the
+    // route answered 500, and the Add tab showed one error with thirty lines lost behind it. The
+    // offline index could have answered all thirty.
+    //
+    // Treating it as "every line errored" hands the same lines to the same fallback below, so the
+    // hard failure and the partial one take one path instead of two.
+    let hits;
+    try {
+      hits = await anilist.searchMany(queries, 4);
+    } catch (err) {
+      hits = { __errored: queries.map((q) => q.key), __failure: err.message };
+    }
 
     const db = store.load();
     const owned = new Set(db.entries.map((e) => e.id));
+    const index = catalogueWeb.get();
 
     const items = parsed.map((p, i) => {
       const candidates = (hits[`k${i}`] || []).map((m) => {
@@ -3300,7 +3768,11 @@ const routes = {
         const medium = m.type === 'MANGA' ? (m.format === 'NOVEL' ? 'NOVEL' : 'MANGA') : 'ANIME';
         return {
           id: `${medium.toLowerCase()}-${m.id}`,
-          anilistId: m.id, medium,
+          // Carried to the confirm step so a commit has somewhere to fall back to. AniList
+          // answered THIS request and can still be refusing the one a minute later, which is
+          // where the 403 on 2026-08-02 caught the owner: the search worked and the write did
+          // not. lib/catalogue.js puts the same field on an offline suggestion.
+          anilistId: m.id, malId: meta.malId, medium,
           title: meta.display, cover: meta.cover, year: meta.seasonYear,
           format: meta.format, country: meta.countryOfOrigin,
           releaseStatus: meta.releaseStatus, totalUnits: meta.totalUnits,
@@ -3316,7 +3788,42 @@ const routes = {
       // server-side failure tells the user their title does not exist, which is a different
       // thing and sends them off to check a spelling that was fine.
       const lookupFailed = (hits.__errored || []).includes(`k${i}`);
-      return { ...p, candidates, viaShortened, lookupFailed, chosen: candidates.length ? 0 : null };
+
+      // THE OFFLINE INDEX ANSWERS WHEN ANILIST CANNOT.
+      //
+      // README.md tells a new person their first move is to paste thirty titles here, and this
+      // route sent every one of them to AniList. On 2026-08-02 AniList answered 403 to everybody
+      // for hours, so every line came back with no candidates and the Add flow stopped at its first
+      // step, which also meant the MyAnimeList fallback in POST /api/commit was unreachable: it
+      // needs a chosen candidate to carry an id.
+      //
+      // Only when the lookup FAILED. A line AniList answered and had nothing for is a real absence,
+      // and quietly widening the everyday match rule is a different change with no measurement
+      // behind it.
+      //
+      // These candidates carry no releaseStatus, no unit count and no score, because the index does
+      // not hold per-title state on purpose: it would be stale the day after a build. Those arrive
+      // with the real fetch at commit time, from whichever source is answering.
+      let offline = [];
+      if (lookupFailed && !candidates.length && index) {
+        offline = catalogue.search(index, p.title, { perKind: 4 }).map((row) => {
+          const s = catalogue.toSuggestion(row);
+          s.alreadyHave = owned.has(s.id);
+          s.fromCatalogue = true;
+          return s;
+        });
+      }
+      const all = candidates.length ? candidates : offline;
+      return {
+        ...p,
+        candidates: all,
+        viaShortened,
+        // Still true, because it is what the page prints, and a line answered from the index while
+        // AniList was refusing is a different sentence from one AniList simply lacked.
+        lookupFailed,
+        fromCatalogue: !candidates.length && offline.length > 0,
+        chosen: all.length ? 0 : null,
+      };
     });
 
     return { items, rate: anilist.rateInfo() };
@@ -3346,17 +3853,56 @@ const routes = {
     }
     const byId = new Map(media.map((m) => [m.id, m]));
 
+    // THE SECOND SOURCE, asked only when the first one could not be.
+    //
+    // On 2026-08-02 graphql.anilist.co answered 403 to everybody with "temporarily disabled due to
+    // severe stability issues" and the owner could not add a single title. Search kept working off
+    // the offline index; committing needs a real metadata fetch and there was nowhere to fetch
+    // from. MyAnimeList through Jikan answers everything AniList does except the tag RANKS, so a
+    // line whose catalogue row carries a MyAnimeList id can still land. Jikan sends
+    // Access-Control-Allow-Origin: *, which is why this build calls it directly and needs none of
+    // the proxy lib/mangadex.js required.
+    //
+    // Never when AniList ANSWERED, and this is a decision rather than an optimisation: an id
+    // AniList does not have is a dead catalogue row, and the two dials that predict this reader
+    // best are built on AniList tag ranks. MyAnimeList is a fallback and not a second opinion.
+    //
+    // Fetched HERE, before store.load() below, so the library is still read after every await and
+    // everything from there to save() stays synchronous. That is the whole reason this route needs
+    // no lock, and an await inside the loop below would quietly take it away.
+    //
+    // A line with no medium is not fetched. Jikan files anime and manga under different endpoints
+    // and there is no AniList record left to read a type off, so guessing one would file a manga
+    // as an anime and count it in episodes.
+    // BOUNDED. lib/mal.js resolveMany carries the loop and the time budget, in lib/ because both
+    // builds run it and hard constraint 9 says shared logic lives there rather than in two copies.
+    // Whatever the budget does not reach comes back unattempted rather than silently missing, and
+    // the person's picks stay on their cards, so pressing Commit again continues from here.
+    let fallbacks = new Map();
+    let unattempted = [];
+    if (lookupError) {
+      const pending = items.filter((it) => it && !byId.has(it.anilistId));
+      const got = await mal.resolveMany(pending);
+      fallbacks = got.resolved;
+      unattempted = got.unattempted;
+    }
+
     // The library is read AFTER the fetch, and everything from here to save() is synchronous,
     // so there is no window for a second action to land in. Same protection queue-action gets
     // from hoisting its fetch, arrived at the same way — this is why the route needs no lock.
     const db = store.load();
     const added = [];
+    // Titles that landed from MyAnimeList rather than AniList. Named rather than counted, because
+    // the page says a different sentence about them: they are in the library and held out of the
+    // taste model until a backfill repairs them.
+    const fellBack = [];
     // Every line that did not land, named. The page used to be handed a count and had to subtract:
     // paste eight, see six, and no word anywhere about which two were dropped or why.
     const skipped = [];
     for (const it of items) {
       const m = byId.get(it.anilistId);
-      if (!m) {
+      const fell = m ? null : fallbacks.get(it.anilistId);
+      if (!m && !(fell && fell.meta)) {
         // No `raw` here. It was carried until 2026-08-02 and read by nothing: every skipped entry
         // corresponds to an item the caller sent, so the caller already holds the line text and
         // maps back by anilistId. The assertion that guarded it justified itself with a page
@@ -3364,17 +3910,23 @@ const routes = {
         // to, and that one was fixed by rendering it rather than by keeping it unread.
         skipped.push({
           anilistId: it.anilistId ?? null,
-          reason: lookupError ? 'anilist-error' : 'not-found',
-          detail: lookupError,
+          // Three different sentences, because they ask for three different things. A line
+          // AniList simply lacks wants another candidate. A line AniList could not be asked
+          // about wants another press later. A line BOTH sources refused wants that too, and
+          // saying only "AniList did not answer" would hide that the fallback was tried and
+          // failed as well.
+          reason: fell ? 'both-sources' : (lookupError ? 'anilist-error' : 'not-found'),
+          detail: fell ? `${lookupError} MyAnimeList: ${fell.error}` : lookupError,
         });
         continue;
       }
-      const meta = store.fromAniList(m);
       // The format matters, not just the type: every other place in this codebase derives a
       // NOVEL from it, and filing a light novel as MANGA sends it down the chapter-tracking
       // path and shows the wrong unit word. The UI always sends a medium, so this fallback is
-      // for any other caller, which is exactly where a quiet inconsistency survives.
+      // for any other caller, which is exactly where a quiet inconsistency survives. A line that
+      // came back from MyAnimeList always carries one: the loop above refuses to fetch without it.
       const medium = it.medium || (m.type === 'MANGA' ? (m.format === 'NOVEL' ? 'NOVEL' : 'MANGA') : 'ANIME');
+      const meta = m ? store.fromAniList(m) : fell.meta;
       const entry = store.makeEntry({
         medium, meta,
         status: it.status || 'CAUGHT_UP',
@@ -3384,13 +3936,84 @@ const routes = {
       });
       store.upsert(db, entry);
       added.push(entry.id);
+      if (!m) fellBack.push({ anilistId: it.anilistId, id: entry.id, title: meta.display });
     }
     // Nothing resolved means nothing changed, and save() is not free of consequence: it stamps
     // updatedAt and schedules a push. That stamp decides which device wins a two-device conflict,
     // so a commit that added nothing could make this browser look newer than the phone that really
     // did add something, and the phone's titles lose.
     if (added.length) store.save(db);
-    return { added: added.length, ids: added, skipped, state: buildState() };
+    // `anilistAnswered` is what the page hangs the repair off. A commit that reached AniList is
+    // the cheapest possible proof that it is up right now, and the person is already waiting, so
+    // that is the moment anything added from MyAnimeList gets its real metadata. Nothing polls and
+    // nothing runs on a timer: hard constraint 7.
+    return {
+      added: added.length, ids: added, skipped, fellBack, anilistAnswered: !lookupError,
+      state: buildState(),
+    };
+  },
+
+  // Pay off the entries that were added while AniList was down.
+  //
+  // A MyAnimeList entry carries `tags: []`, and the two dials that predict this reader best read
+  // AniList tag NAMES WITH RANKS: competence at r = 0.568, agency at r = 0.345. lib/fit.js z-scores
+  // every dial, so a missing value becomes 0, which is the mean, so an unmarked partial entry would
+  // not score low, it would pretend to be an ordinary average data point. lib/fit.js therefore
+  // holds them out entirely, and they stay out until this route runs. A partial entry is a debt.
+  //
+  // Triggered by an action and never by a clock. The page calls it after a commit that reached
+  // AniList, and the Library tab has a button for somebody who does not want to wait for one.
+  'POST /api/backfill': async () => {
+    const partial = store.load().entries.filter((e) => isPartial(e.meta) && e.meta.anilistId > 0);
+    const batch = partial.slice(0, BACKFILL_BATCH);
+    if (!batch.length) return { repaired: 0, checked: 0, remaining: 0, titles: [] };
+
+    let media;
+    try {
+      media = await anilist.mediaByIds(batch.map((e) => e.meta.anilistId));
+      // Same quiet shape POST /api/commit guards against: HTTP 200, a null field and the real
+      // complaint in `errors`, which nothing throws on. Read as success it would report a clean
+      // run that repaired nothing, and a clean run and an outage are the same number.
+      const errors = media.__errors || [];
+      if (errors.length) throw new Error(`AniList GraphQL: ${errors.map((e) => e.message).join('; ')}`);
+    } catch (err) {
+      // Returned rather than thrown. A repair that could not run is not a failed commit: the
+      // titles are in the library either way, and the page's own message is the whole outcome.
+      return { repaired: 0, checked: batch.length, remaining: partial.length, titles: [], error: err.message };
+    }
+
+    // Re-read AFTER the fetch and written synchronously from here to save(), the shape POST
+    // /api/commit uses. Holding the library across the await would write away whatever was
+    // recorded while AniList was being asked.
+    const db = store.load();
+    const byId = new Map(media.map((m) => [m.id, m]));
+    const titles = [];
+    for (const e of db.entries) {
+      if (!isPartial(e.meta)) continue;
+      const m = byId.get(e.meta.anilistId);
+      if (!m) continue;
+      // WHOLESALE, onto the entry that is already there. The marker leaves with the object it was
+      // written on, so nobody has to remember to clear it, and the entry keeps its id, its
+      // progress, its score and every comparison naming it. A repair that made a second row would
+      // split one title's history in two and leave the ranking answering about a ghost.
+      e.meta = store.fromAniList(m);
+      // Derived from meta.format when the entry was made, so it has to move with the metadata it
+      // was derived from: MyAnimeList files a short as TV and AniList calls it TV_SHORT.
+      e.standalone = store.isStandalone(e.meta);
+      e.updatedAt = store.nowISO();
+      titles.push(e.meta.display);
+    }
+    // Nothing repaired means nothing changed, and save() stamps updatedAt and schedules a push.
+    // Same rule the commit route was fixed to on 2026-08-02: that stamp decides which device wins
+    // a two-device conflict.
+    if (titles.length) store.save(db);
+    return {
+      repaired: titles.length,
+      checked: batch.length,
+      remaining: Math.max(0, partial.length - titles.length),
+      titles,
+      state: buildState(),
+    };
   },
 
   'POST /api/entry': async ({ body }) => {
@@ -4055,6 +4678,23 @@ function fromAniList(media) {
   };
 }
 
+// Metadata that came from somewhere other than AniList and is missing what this app scores on.
+//
+// lib/mal.js marks everything it builds, because MyAnimeList has genres, themes and demographics
+// and none of them carry a 0-100 rank, so `tags` comes back empty. It exists at all because
+// graphql.anilist.co answered 403 to everybody on 2026-08-02 and a commit had nowhere to fetch
+// from.
+//
+// The marker is what lib/fit.js holds out on. Nothing else in the app treats a partial entry
+// differently: it displays, ranks and filters like any other, because the fields those read are
+// the ones MyAnimeList can supply.
+//
+// A backfill hands upsert a complete meta object, which REPLACES the stored one whole, so the
+// marker leaves with the object it was written on and nobody has to remember to clear it.
+function isPartial(meta) {
+  return !!(meta && meta.partial);
+}
+
 // Formats that are one-offs rather than a run to rank against other runs. The first user,
 // 2026-07-27: "i cant really rate them vs the rest of anime since they're one-offs". A
 // 90-minute film against a three-season show is not a fair comparison, and forcing it spends a
@@ -4116,6 +4756,22 @@ function upsert(db, entry) {
   const old = db.entries[i];
   const merged = { ...old, ...entry, addedAt: old.addedAt, updatedAt: nowISO() };
 
+  // A PARTIAL RECORD NEVER OVERWRITES A COMPLETE ONE. This is a downgrade guard, and it sits here
+  // rather than in the two commit routes because every caller needs it and there are two of them
+  // already.
+  //
+  // Measured on 2026-08-02, on a real server: re-committing a title the library already held, on a
+  // day AniList was refusing, replaced its meta wholesale through the spread above. The entry came
+  // back with 0 tags and partial: true, so its AniList tag RANKS were gone and it silently dropped
+  // out of the taste fit, which excludes partial entries by design. Nothing said anything. The
+  // paste flow reaches it: an already-held candidate is labelled "(already in library)" and still
+  // committed, unlike the search box, which blocks it.
+  //
+  // The user's own answer still lands. Status, progress and notes come through the merge above, and
+  // only the metadata is held back, because a re-add is somebody saying "I finished it now" rather
+  // than "replace what you know about this".
+  if (isPartial(entry.meta) && old.meta && !isPartial(old.meta)) merged.meta = old.meta;
+
   for (const k of USER_OWNED) {
     // A fresh makeEntry carries the empty version of each of these. Keep whatever the stored
     // entry has unless the incoming value is genuinely something rather than a default.
@@ -4167,7 +4823,7 @@ function patch(db, id, changes) {
 module.exports = {
   MEDIUM, STATUS, VERDICT, STANDALONE_FORMATS, FULL_RUN_FORMATS, USER_OWNED, EMPTY,
   nowISO, emptyDb, normalize,
-  unitFor, fromAniList, isStandalone, isOneOffFormat, makeEntry, upsert, patch,
+  unitFor, fromAniList, isPartial, isStandalone, isOneOffFormat, makeEntry, upsert, patch,
 };
 };
 
@@ -6198,6 +6854,6 @@ module.exports = { ageVerdict, audioVerdict, applyFilters, owed, tasteProfile, s
 var __app = __require("api-browser");
 // What this build actually contains. It is the one thing a deployed page cannot otherwise be
 // asked, and it is what the build's own check asserts against.
-__app.modules = ["adaptations","anilist","api-browser","axes","catalogue","catalogue-web","chapters","config","extent","fit","foryou","franchise","linking","mangadex","parse","progression","rank","routes","store-core","store-web","supabase","taste"];
+__app.modules = ["adaptations","anilist","api-browser","axes","catalogue","catalogue-web","chapters","config","extent","fit","foryou","franchise","linking","mal","mangadex","parse","progression","rank","routes","store-core","store-web","supabase","taste"];
 window.NimeFlow = __app;
 })();

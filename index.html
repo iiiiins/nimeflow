@@ -162,6 +162,9 @@
     <h2>Library</h2>
     <p class="sub">Caught up means you've seen everything released, not that the work is finished — so new seasons resurface in Now. Change status or progress inline; it saves immediately. Movies, specials and OVAs get a <em>verdict</em> instead of a score, because they can't fairly be compared against a full run — that verdict is yours to keep and is weighted zero in the taste model, so a franchise isn't counted twice.</p>
     <div style="margin-bottom:10px"><input type="text" id="filterBox" placeholder="filter…" style="width:260px"></div>
+    <!-- Titles added while AniList was down, and the button that repairs them. renderPartial says
+         why it is on this tab and not on Data. -->
+    <div id="partialNote"></div>
     <table><thead><tr><th></th><th>Title</th><th>Status</th><th>Progress</th><th>Score</th><th title="Rated on childhood, not on what you'd start today. Keeps the rating, stops it anchoring a recommendation shelf.">Nostalgia</th><th>Medium</th><th>Release</th></tr></thead>
     <tbody id="libBody"></tbody></table>
   </section>
@@ -304,6 +307,10 @@ const STATUSES = ['CAUGHT_UP','COMPLETED','WATCHING','PAUSED','DROPPED','PLANNED
 const SKIP_REASON = {
   'not-found': 'AniList had no title under that id, so nothing was written',
   'anilist-error': 'AniList did not answer, so this line was not looked up. Your choice is kept here: press Commit again once it does.',
+  // The third case, added when the MyAnimeList fallback did. Told as "AniList did not answer" it
+  // would read as one source being asked, and somebody would sit waiting for the source that is
+  // already covered. Both were asked and both refused.
+  'both-sources': 'Neither AniList nor MyAnimeList could give this one, so nothing was written. Your choice is kept here: press Commit again later.',
 };
 
 // A browser cannot read a cross-origin response it was refused, so every server-side failure with
@@ -430,6 +437,14 @@ function renderLibrary() {
     const tdC = el('td'); if (e.cover){ const i=el('img','cov'); i.src=e.cover; i.style.width='30px'; i.style.height='42px'; i.loading='lazy'; tdC.append(i);} tr.append(tdC);
     const tdT = el('td'); tdT.append(el('div','t', e.title));
     tdT.append(el('div','meta', [e.year, e.country, e.averageScore ? 'AniList ' + e.averageScore : null].filter(Boolean).join(' · ')));
+    // Marked on the row, not only in the count above. This title is in the library and invisible
+    // to Discover and to the taste profile, and a person scanning for why one of their favourites
+    // never shows up in a shelf has nowhere else to find out.
+    if (e.partial) {
+      const tag = el('span','tag warn','from MyAnimeList · no tag ranks');
+      tag.title = 'AniList was not answering when this was added. It is skipped by the taste model until repaired.';
+      tdT.append(tag);
+    }
     tr.append(tdT);
 
     const sel = el('select');
@@ -491,6 +506,67 @@ function renderLibrary() {
   }
 }
 
+// WHAT BEING PARTIAL COSTS, said where the titles are.
+//
+// An entry added from MyAnimeList has no tag ranks, and the recommender runs on tag ranks, so it
+// is skipped by Discover and by the taste profile. Nothing else about it is different, which is
+// exactly why this has to be on screen: the title is in the library, it looks complete, and it is
+// silently absent from every shelf.
+//
+// The repair button is here rather than on the Data tab because the desktop build removes that tab
+// altogether, and the folder build is the one somebody receives who wants nothing to leave their
+// machine. One button, both builds, next to the sentence it answers.
+let BACKFILL_SAID = '';
+
+function renderPartial() {
+  const box = $('#partialNote');
+  if (!box) return;
+  box.innerHTML = '';
+  const n = (STATE.entries || []).filter((e) => e.partial).length;
+  if (!n) { BACKFILL_SAID = ''; return; }
+
+  const card = el('div', 'card');
+  card.append(el('b', null, `${n} ${n === 1 ? 'title is' : 'titles are'} missing AniList data`));
+  card.append(el('div', null,
+    'AniList was not answering when ' + (n === 1 ? 'it was' : 'they were') + ' added, so '
+    + (n === 1 ? 'it came' : 'they came') + ' from MyAnimeList instead. That has no tag ranks, and the '
+    + 'recommender runs on those, so ' + (n === 1 ? 'this one is' : 'these are') + ' left out of '
+    + 'Discover and out of your taste profile until repaired. Everything else about '
+    + (n === 1 ? 'it' : 'them') + ' works.'));
+  const acts = el('div');
+  acts.style.cssText = 'display:flex;gap:8px;margin-top:11px;flex-wrap:wrap;align-items:center';
+  const go = el('button', 'go', 'Repair from AniList');
+  go.onclick = () => runBackfill();
+  acts.append(go);
+  acts.append(el('span', 'muted', BACKFILL_SAID || 'it also happens on its own the next time you add a title'));
+  card.append(acts);
+  box.append(card);
+}
+
+// The manual half of the repair. The automatic half is one call in the commit handler below, on
+// the reply that says AniList answered. Neither is a timer: hard constraint 7.
+async function runBackfill() {
+  BACKFILL_SAID = 'asking AniList…';
+  renderPartial();
+  try {
+    const r = await api('/api/backfill', { method:'POST', headers:{'Content-Type':'application/json'}, body: '{}' });
+    BACKFILL_SAID = r.error
+      ? 'AniList still is not answering: ' + r.error
+      : r.repaired
+        ? `repaired ${r.repaired}` + (r.remaining ? ` · ${r.remaining} still to do, press again` : '')
+        : 'AniList answered and had nothing for these';
+    // The reply carries the whole state on the path that wrote, and nothing on the paths that did
+    // not. renderAll redraws this panel, so the message is held in BACKFILL_SAID rather than
+    // written into a node the redraw is about to replace.
+    if (r.state) { STATE = r.state; renderAll(); } else renderPartial();
+    return r;
+  } catch (e) {
+    BACKFILL_SAID = 'repair failed: ' + e.message;
+    renderPartial();
+    return null;
+  }
+}
+
 async function patch(id, changes) {
   try { await api('/api/entry', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ id, changes }) }); await refresh(); }
   catch (e) { alert('save failed: ' + e.message); }
@@ -504,9 +580,12 @@ $('#fitBtn').onclick = async () => {
     const top = r.dials.filter((d) => d.r !== null && Math.abs(d.r) >= 0.2);
     // Say what is in the file before it lands in their downloads folder, so sending it on is
     // an informed act rather than a blind one.
-    note.textContent = top.length
+    // Held-out titles are named here because this is the one place the count is quoted back. A
+    // shrunken "ranked titles" with no reason attached reads as titles going missing.
+    const held = r.partialUnits ? ` · ${r.partialUnits} left out for missing AniList data` : '';
+    note.textContent = (top.length
       ? `${r.scoredUnits} ranked titles · strongest dial ${top[0].id} at r=${top[0].r} · ${r.worstMisses.length} unexplained titles`
-      : `${r.scoredUnits} ranked titles · no dial predicts you yet · ${r.worstMisses.length} unexplained titles`;
+      : `${r.scoredUnits} ranked titles · no dial predicts you yet · ${r.worstMisses.length} unexplained titles`) + held;
     const blob = new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
@@ -521,7 +600,7 @@ $('#fitBtn').onclick = async () => {
 // Added after the first-run panel shipped stale: committing three titles updated the header
 // count and left the panel reading "0 added", because four separate call sites each listed
 // the views they happened to know about. A view added later is invisible to all of them.
-function renderAll() { renderStat(); renderSettings(); renderFirstRun(); renderCrowdFit(); renderOwed(); renderLibrary(); renderData(); }
+function renderAll() { renderStat(); renderSettings(); renderFirstRun(); renderCrowdFit(); renderOwed(); renderLibrary(); renderPartial(); renderData(); }
 
 // The three setting checkboxes are `checked` in the HTML and were never read back from the
 // stored settings. So unchecking a filter saved false, a reload drew it checked again, and the
@@ -964,7 +1043,10 @@ function renderParsed() {
     commit.disabled = true; commit.textContent = 'saving…';
     const items = PARSED.filter(p => p.candidates.length && p.chosen != null).map(p => {
       const c = p.candidates[p.chosen];
-      return { anilistId: c.anilistId, medium: c.medium, status: p.guess.status, progress: p.guess.episodes || 0, notes: p.notes, raw: p.raw };
+      // malId travels with the pick. It is what the commit falls back to when AniList refuses,
+      // and it is null on a candidate from a catalogue built before the column existed, which is
+      // the ordinary case and behaves exactly as it always did.
+      return { anilistId: c.anilistId, malId: c.malId ?? null, medium: c.medium, status: p.guess.status, progress: p.guess.episodes || 0, notes: p.notes, raw: p.raw };
     });
     try {
       const r = await api('/api/commit', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ items }) });
@@ -1001,12 +1083,24 @@ function renderParsed() {
       const retryable = PARSED.length;
       $('#dump').value = unmatchedRaw.join('\n');
       renderParsed();
+      // A title that landed from MyAnimeList is IN the library and missing what the recommender
+      // reads, so "added 3" alone would be true and would hide the half of it that matters. The
+      // Library tab carries the same fact with the button that undoes it.
+      const viaMal = (r.fellBack || []).length;
       $('#parseNote').textContent = `added ${r.added}` +
+        (viaMal ? ` · ${viaMal} from MyAnimeList because AniList did not answer: no tag ranks yet, see the Library tab` : '') +
         (unmatched ? ` · ${unmatched} left in the box: nothing matched them, try a different spelling` : '') +
         (retryable ? ` · ${retryable} kept below with your choices, press Commit again to retry` : '');
       // Warn on either kind of leftover. Reading PARSED.length alone stopped being right when the
       // unmatched lines moved out of it and into the box, where they are just as unfinished.
-      $('#parseNote').style.color = (unmatched || retryable) ? 'var(--warn)' : '';
+      $('#parseNote').style.color = (unmatched || retryable || viaMal) ? 'var(--warn)' : '';
+      // PAY THE DEBT WHILE THE ANSWER IS KNOWN.
+      //
+      // This commit reached AniList, which is the cheapest possible proof that it is up right now,
+      // and the person is already standing here. Anything added from MyAnimeList on an earlier day
+      // gets its real metadata back and rejoins the taste model. Skipped when there is no debt, so
+      // the ordinary commit costs nothing extra, and nothing here runs on a timer: hard constraint 7.
+      if (r.anilistAnswered && (STATE.entries || []).some((e) => e.partial)) await runBackfill();
     } catch (e) { commit.disabled=false; commit.textContent='Commit'; alert('commit failed: ' + e.message); }
   };
   bar.append(commit);

@@ -4209,13 +4209,32 @@ function schedulePersist() {
 // Merged rather than replaced, because backups are append-only and a snapshot either tab took is
 // a snapshot somebody may need. The conflict paths below promise a restore point; a whole-list
 // overwrite from an idle tab would delete the one they just promised.
+// The in-memory list is merged BACK INTO on completion, never overwritten with the copy this call
+// started from.
+//
+// The bug that was here, found 2026-08-02 while writing scenario 22 and filed as e5d773: `mine` is
+// captured when the write starts and `backupList = merged` runs when its transaction completes. A
+// snapshot taken inside that window was dropped from memory AND never reached storage, because the
+// next write captured the already-truncated list. The page said "saved as a restore point" while
+// the snapshot no longer existed anywhere, which is the exact shape this file exists to prevent:
+// not losing data, but losing it while reporting success.
+//
+// The window is real rather than theoretical. importJSON takes a protected snapshot and queues a
+// write; a withWrite callback finishing microseconds later takes another; the second one wins and
+// the first is gone.
 function writeBackups() {
   const mine = backupList.slice();
   let merged = mine;
   return idbUpdate(KEY_BACKUPS, (stored) => {
     merged = mergeBackups(Array.isArray(stored) ? stored : [], mine);
     return merged;
-  }).then((res) => { if (!res.skipped) backupList = merged; });
+  }).then((res) => {
+    if (res.skipped) return;
+    // Anything added while the transaction was open is in backupList and not in `merged`. Merging
+    // the two keeps it, and the next write will carry it to storage. mergeBackups dedupes, so a
+    // snapshot present in both survives once.
+    backupList = mergeBackups(merged, backupList);
+  });
 }
 
 // Never rejects. Resolves true when the snapshots reached storage, false when they did not —

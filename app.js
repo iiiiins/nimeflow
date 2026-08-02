@@ -213,7 +213,36 @@ async function gql(query, variables = {}, attempt = 0) {
   if (json.errors && !json.data) {
     throw new Error(`AniList GraphQL: ${json.errors.map((e) => e.message).join('; ')}`);
   }
+
+  // A response can carry BOTH data and errors: in a batched query one alias fails and the rest
+  // resolve. Throwing would take the good half down with the bad, which is why this returns the
+  // data. But returning it silently was the other half of the bug: the failed alias arrives as
+  // null, and null is indistinguishable from "AniList has no such title", so a server-side error
+  // was being reported to the user as "no match on AniList — skipped".
+  //
+  // Non-enumerable, so nothing that iterates or serialises this object changes shape, and any
+  // caller that wants to tell a failure from an absence can ask.
+  if (json.data && json.errors && json.errors.length) {
+    Object.defineProperty(json.data, '__errors', { value: json.errors, enumerable: false, configurable: true });
+  }
   return json.data;
+}
+
+// Which aliases in a batched response actually failed. GraphQL puts the alias first in `path`, so
+// `["r3","media"]` names the query built for item r3. An error with no usable path is reported
+// against every alias in the batch, because "one of these failed and we cannot tell which" is
+// still a better answer than telling all of them they do not exist.
+function failedAliases(data, aliases) {
+  const errors = (data && data.__errors) || [];
+  if (!errors.length) return [];
+  const named = new Set();
+  let unattributed = false;
+  for (const e of errors) {
+    const first = Array.isArray(e.path) ? e.path[0] : null;
+    if (first && aliases.includes(first)) named.add(first);
+    else unattributed = true;
+  }
+  return unattributed ? [...aliases] : [...named];
 }
 
 const MEDIA_FIELDS = `
@@ -252,7 +281,11 @@ const MEDIA_FIELDS = `
 async function searchMany(items, perPage = 5) {
   if (!items.length) return {};
   const out = {};
-  await searchPass(items, perPage, out);
+  // Keys whose lookup ERRORED rather than came back empty. The distinction is the difference
+  // between "AniList has no such title" and "AniList did not answer", and the user is entitled to
+  // be told which one happened to their line.
+  const errored = new Set();
+  await searchPass(items, perPage, out, errored);
 
   // Retry whatever matched nothing, with a shorter term.
   //
@@ -274,10 +307,11 @@ async function searchMany(items, perPage = 5) {
     const failed = items.filter((it) => !(out[it.key] || []).length && it.term.trim().split(/\s+/).length > words);
     if (!failed.length) continue;
     const shortened = failed.map((it) => ({ ...it, term: it.term.trim().split(/\s+/).slice(0, words).join(' ') }));
-    await searchPass(shortened, perPage, out);
+    await searchPass(shortened, perPage, out, errored);
     for (const it of failed) if ((out[it.key] || []).length) fallback.add(it.key);
   }
   out.__fallback = [...fallback];
+  out.__errored = [...errored];
   return out;
 }
 
@@ -319,7 +353,7 @@ async function suggest(term, perType = 6) {
   return out;
 }
 
-async function searchPass(items, perPage, out) {
+async function searchPass(items, perPage, out, failed) {
   const CHUNK = 8;
   for (let i = 0; i < items.length; i += CHUNK) {
     const slice = items.slice(i, i + CHUNK);
@@ -330,8 +364,18 @@ async function searchPass(items, perPage, out) {
         }
       }`);
     const data = await gql(`query {${parts.join('\n')}\n}`);
+
+    // An alias that ERRORED is not an alias that found nothing. Without this the caller sees an
+    // empty array either way and tells the user the title does not exist.
+    const broke = new Set(failedAliases(data, slice.map((_, k) => `r${k}`)));
+
     slice.forEach((it, k) => {
       const hits = (data[`r${k}`] && data[`r${k}`].media) || [];
+      if (broke.has(`r${k}`) && !hits.length) {
+        failed.add(it.key);
+      } else if (hits.length) {
+        failed.delete(it.key);          // a later pass found it, so it is no longer a failure
+      }
       if (hits.length || !out[it.key]) out[it.key] = hits;
     });
   }
@@ -718,6 +762,535 @@ function pearson(a, b) {
 }
 
 module.exports = { AXES, byId, pearson };
+};
+
+// ---- lib/catalogue.js --------------------------------------------------------
+__modules["catalogue"] = function (module, exports, require) {
+'use strict';
+
+// The local title index. Pure: text in, matches out, no filesystem and no network, so the same
+// file runs in the desktop server and inside the browser bundle.
+//
+// It exists because AniList's search cannot do prefixes. Measured 2026-08-02: "frie" and "frier"
+// return nothing while "friere" returns Frieren, on both SEARCH_MATCH and POPULARITY_DESC. Asking
+// differently does not fix it, so the app carries its own index of the titles most people mean and
+// falls back to AniList for the rest.
+//
+// Who loads the text is per build: server.js reads data/catalogue.tsv off disk, the browser fetches
+// catalogue.tsv once and keeps it. Neither concern belongs here.
+
+const FORMAT_VERSION = 1;
+const MAGIC = '#nimeflow-catalogue';
+
+// Row columns, in order. Kept as one list so serialise and parse cannot drift apart.
+const COLUMNS = ['id', 'kind', 'romaji', 'english', 'syn', 'year', 'format', 'country', 'popularity', 'cover'];
+
+const KIND_ANIME = 0;
+const KIND_MANGA = 1;
+
+// Latin here means "reachable from the keyboard someone is typing English or romaji on".
+// Native-script synonyms are dropped rather than kept for completeness: they were a fifth of the
+// payload and no query in this box will ever match one.
+const LATIN = /^[\x20-\x7EÀ-ɏ‐-‧]+$/;
+
+// Diacritics fold, punctuation becomes a space, everything else survives. Deliberately NOT stripping
+// spaces: word starts are a match tier of their own, so "frie" reaching Frieren inside
+// "Sousou no Frieren" has to be distinguishable from an accidental substring.
+function normalise(value) {
+  return String(value == null ? '' : value)
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+// Two titles are "the same" when only case, punctuation or spacing separates them. That is the test
+// for dropping an english title that merely restyles the romaji, which is most of them.
+function sameTitle(a, b) {
+  return normalise(a).replace(/ /g, '') === normalise(b).replace(/ /g, '');
+}
+
+// Which synonyms earn their bytes. Whole synonyms cost 48 B a title gzipped against 23.5 for none;
+// this filter brings it to 41.5 while keeping SnK, AoT and "Only I Level Up", which are things
+// people type.
+function usefulSynonyms(synonyms, romaji, english, cap) {
+  const seen = [normalise(romaji), normalise(english)].filter(Boolean).map((s) => s.replace(/ /g, ''));
+  const out = [];
+  for (const raw of synonyms || []) {
+    if (out.length >= cap) break;
+    if (!raw || !LATIN.test(raw)) continue;
+    const key = normalise(raw).replace(/ /g, '');
+    if (!key) continue;
+    // A synonym that only extends or truncates a title the row already has reaches no query that
+    // title does not already reach, so it is pure payload.
+    if (seen.some((k) => k.startsWith(key) || key.startsWith(k))) continue;
+    seen.push(key);
+    out.push(raw);
+  }
+  return out;
+}
+
+// Tabs and newlines are the record separators, so a title carrying one would split a row in half.
+// The guard stays even though no live title does, because the failure is silent corruption of a
+// neighbouring row rather than an error.
+function clean(value) {
+  return String(value == null ? '' : value).replace(/[\t\r\n]+/g, ' ').trim();
+}
+
+// AniList cover URLs are https://s4.anilist.co/file/anilistcdn/media/<anime|manga>/cover/medium/<file>.
+// Only the last part varies and the type is already a column, so the constant prefix is not stored
+// ten thousand times.
+const COVER_PREFIX = 'https://s4.anilist.co/file/anilistcdn/media/';
+
+function coverFile(url) {
+  const s = String(url || '');
+  const at = s.lastIndexOf('/');
+  return at < 0 ? '' : s.slice(at + 1);
+}
+
+function coverUrl(file, kind) {
+  if (!file) return null;
+  return `${COVER_PREFIX}${kind === KIND_MANGA ? 'manga' : 'anime'}/cover/medium/${file}`;
+}
+
+// `covers: false` drops the cover column. Measured on the real 10000-row file: covers are 154KB of
+// its 582KB gzipped, because the filename carries a random hash and random text does not compress.
+// Everything else still works without them; the dropdown just shows no thumbnail until a title is
+// committed, at which point the real fetch brings one. Kept ON by default because this app's whole
+// UI is rows of cover art, and a coverless dropdown reads as broken rather than as lean.
+function serialise(media, { builtAt = '', synonymCap = 2, covers = true } = {}) {
+  const lines = [[MAGIC, FORMAT_VERSION, builtAt, media.length, COLUMNS.join(',')].join('\t')];
+  for (const m of media) {
+    const romaji = clean(m.title && m.title.romaji);
+    const englishRaw = clean(m.title && m.title.english);
+    const english = englishRaw && !sameTitle(englishRaw, romaji) ? englishRaw : '';
+    if (!romaji && !english) continue;               // nothing to match on, so nothing to carry
+    const syn = usefulSynonyms(m.synonyms, romaji, english, synonymCap).map(clean).filter(Boolean);
+    lines.push([
+      m.id,
+      m.type === 'MANGA' ? KIND_MANGA : KIND_ANIME,
+      romaji,
+      english,
+      syn.join('~'),
+      m.seasonYear || 0,
+      m.format || '',
+      m.countryOfOrigin || '',
+      m.popularity || 0,
+      covers ? coverFile(m.coverImage && m.coverImage.medium) : '',
+    ].join('\t'));
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+// One haystack per row, built once at parse time so a keystroke costs one indexOf per row rather
+// than re-normalising every title.
+//
+// Each variant is wrapped in sentinels. normalise() turns everything outside [a-z0-9 ] into a
+// space, so neither sentinel can occur inside a variant, and that is what makes "starts a title"
+// separable from "starts a word in the middle of a title" using nothing but string search. Without
+// them, "frieren" inside "sousou no frieren" reads as an exact match on the whole title.
+const OPEN = '\u0001';
+const CLOSE = '\u0002';
+
+function haystack(romaji, english, syn) {
+  const variants = [romaji, english, ...(syn ? syn.split('~') : [])].filter(Boolean);
+  return variants.map((v) => `${OPEN}${normalise(v)}${CLOSE}`).join('');
+}
+
+function parse(text) {
+  const src = String(text || '');
+  const nl = src.indexOf('\n');
+  const header = (nl < 0 ? src : src.slice(0, nl)).split('\t');
+  if (header[0] !== MAGIC) throw new Error('not a NimeFlow catalogue');
+  const version = Number(header[1]);
+  if (version !== FORMAT_VERSION) {
+    // A newer file read by an older page would mis-column every row, which shows up as wrong titles
+    // rather than as an error. Refusing is the only safe read.
+    throw new Error(`catalogue format ${version}, this build reads ${FORMAT_VERSION}`);
+  }
+
+  const rows = [];
+  const lines = src.split('\n');
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    const c = line.split('\t');
+    if (c.length < COLUMNS.length) continue;
+    const row = {
+      id: Number(c[0]),
+      kind: Number(c[1]),
+      romaji: c[2],
+      english: c[3],
+      syn: c[4],
+      year: Number(c[5]) || null,
+      format: c[6] || null,
+      country: c[7] || null,
+      popularity: Number(c[8]) || 0,
+      cover: c[9] || '',
+    };
+    row.hay = haystack(row.romaji, row.english, row.syn);
+    rows.push(row);
+  }
+  return { version, builtAt: header[2] || '', rows };
+}
+
+// Match quality, best first. This ordering IS the ranking: popularity only breaks ties inside a
+// tier, because a popular substring match is still a worse answer than an unpopular exact one.
+const EXACT = 0;        // the query is a whole title       ("berserk"  -> Berserk)
+const TITLE_PREFIX = 1; // a title starts with it           ("solo lev" -> Solo Leveling)
+const WORD_PREFIX = 2;  // a word inside a title does       ("frie"     -> Sousou no Frieren)
+const ANYWHERE = 3;     // it appears somewhere at all
+
+function tierOf(hay, q) {
+  if (hay.indexOf(`${OPEN}${q}${CLOSE}`) >= 0) return EXACT;
+  if (hay.indexOf(`${OPEN}${q}`) >= 0) return TITLE_PREFIX;
+  if (hay.indexOf(` ${q}`) >= 0) return WORD_PREFIX;
+  return ANYWHERE;
+}
+
+// Search the catalogue.
+//
+// Ranked per kind and then interleaved, rather than as one list: an anime-heavy catalogue buries
+// manga otherwise, and the reason this app exists is that its first user's favourite work is a
+// manhwa. Same shape as anilist.suggest(), so the route merges the two without special-casing
+// either.
+function search(index, term, { perKind = 6, exclude = null } = {}) {
+  const q = normalise(term);
+  if (!index || !index.rows || q.length < 2) return [];
+
+  const found = [[], []];
+  for (const row of index.rows) {
+    if (row.hay.indexOf(q) < 0) continue;            // the cheap test that rejects almost every row
+    if (exclude && exclude.has(row.id)) continue;
+    found[row.kind === KIND_MANGA ? 1 : 0].push(row);
+  }
+
+  const ranked = found.map((list) => list
+    .map((row) => ({ row, tier: tierOf(row.hay, q) }))
+    .sort((a, b) => (a.tier - b.tier) || (b.row.popularity - a.row.popularity))
+    .slice(0, perKind)
+    .map((hit) => ({ ...hit.row, tier: hit.tier })));
+
+  const out = [];
+  for (let i = 0; i < perKind; i++) {
+    if (ranked[0][i]) out.push(ranked[0][i]);
+    if (ranked[1][i]) out.push(ranked[1][i]);
+  }
+  return out;
+}
+
+// A catalogue row wearing the shape the suggest route returns for an AniList hit, so the UI renders
+// one list and does not care which index found which row.
+//
+// The fields a catalogue row does not carry are null rather than absent. releaseStatus, totalUnits
+// and averageScore are per-title state that would be stale the day after the catalogue was built,
+// and a stale "12 episodes" is the class of confident wrong number this project exists to avoid.
+// They arrive with the real fetch at commit time.
+function toSuggestion(row) {
+  const medium = row.kind === KIND_MANGA ? (row.format === 'NOVEL' ? 'NOVEL' : 'MANGA') : 'ANIME';
+  return {
+    id: `${medium.toLowerCase()}-${row.id}`,
+    anilistId: row.id,
+    medium,
+    title: row.english || row.romaji,
+    cover: coverUrl(row.cover, row.kind),
+    year: row.year,
+    format: row.format,
+    country: row.country,
+    releaseStatus: null,
+    totalUnits: null,
+    averageScore: null,
+    fromCatalogue: true,
+  };
+}
+
+// --- the whole suggest decision, in one place --------------------------------------------------
+//
+// Both builds call this. server.js and web-src/routes.js differ only in where the catalogue text
+// came from and which fetcher they hand in, because a route body copied into two files is how the
+// desktop app and the hosted site come to disagree about what a title is.
+
+const storeCore = require('./store-core');
+
+// How many good local hits make an AniList request pointless. Tier matters, not just count: twelve
+// substring matches for "attack on titan final" are not an answer, and skipping the API on them
+// would make the catalogue a downgrade for exactly the long queries it is worst at.
+const ENOUGH_LOCAL = 4;
+
+function libraryMatches(entries, term, limit = 4) {
+  const q = normalise(term);
+  if (q.length < 2) return [];
+  return (entries || [])
+    .filter((e) => normalise(e.meta.display).indexOf(q) >= 0)
+    .slice(0, limit)
+    .map((e) => ({
+      id: e.id, anilistId: e.meta.anilistId, medium: e.medium,
+      title: e.meta.display, cover: e.meta.cover, year: e.meta.seasonYear,
+      format: e.meta.format, country: e.meta.countryOfOrigin,
+      releaseStatus: e.meta.releaseStatus, totalUnits: e.meta.totalUnits,
+      averageScore: e.meta.averageScore, alreadyHave: true, mine: true,
+    }));
+}
+
+function fromMedia(m) {
+  const meta = storeCore.fromAniList(m);
+  const medium = m.type === 'MANGA' ? (m.format === 'NOVEL' ? 'NOVEL' : 'MANGA') : 'ANIME';
+  return {
+    id: `${medium.toLowerCase()}-${m.id}`,
+    anilistId: m.id, medium,
+    title: meta.display, cover: meta.cover, year: meta.seasonYear,
+    format: meta.format, country: meta.countryOfOrigin,
+    releaseStatus: meta.releaseStatus, totalUnits: meta.totalUnits,
+    averageScore: meta.averageScore,
+  };
+}
+
+// term + library + catalogue + (maybe) AniList -> the dropdown.
+//
+// Order of preference is deliberate. The user's own library first, because "I already have this" is
+// the most common reason a search looks broken. Then the catalogue, which answers instantly and
+// offline. AniList last, and only when the local answer is thin, because it is the slow, rate
+// limited, prefix-blind one.
+async function suggest({ term, entries = [], index = null, fetchApi = null, perKind = 6 }) {
+  const q = String(term == null ? '' : term).trim();
+  const mine = libraryMatches(entries, q);
+  if (normalise(q).length < 2) return { q, results: [], mine, note: null, source: 'none' };
+
+  const owned = new Set((entries || []).map((e) => e.id));
+  const seenAnilistIds = new Set(mine.map((m) => m.anilistId).filter((id) => id > 0));
+
+  const local = search(index, q, { perKind, exclude: seenAnilistIds }).map((row) => {
+    const s = toSuggestion(row);
+    s.alreadyHave = owned.has(s.id);
+    s.tier = row.tier;
+    return s;
+  });
+
+  const strong = local.filter((r) => r.tier <= WORD_PREFIX).length;
+  if (strong >= ENOUGH_LOCAL) {
+    return { q, results: local, mine, note: null, source: 'catalogue' };
+  }
+
+  let media = [];
+  let apiError = null;
+  if (fetchApi) {
+    try {
+      media = await fetchApi(q);
+    } catch (err) {
+      // A dead network must not throw away the local answers already in hand. This is the
+      // difference between "offline search still works" and "offline search reports an error".
+      apiError = err && err.message ? err.message : String(err);
+    }
+  }
+
+  const have = new Set([...local.map((r) => r.id), ...mine.map((r) => r.id)]);
+  const fromApi = [];
+  for (const m of media || []) {
+    const r = fromMedia(m);
+    if (have.has(r.id)) continue;
+    have.add(r.id);
+    r.alreadyHave = owned.has(r.id);
+    fromApi.push(r);
+  }
+
+  const results = [...local, ...fromApi];
+  const source = local.length && fromApi.length ? 'catalogue+anilist'
+    : local.length ? 'catalogue'
+      : fromApi.length ? 'anilist' : 'none';
+
+  let note = null;
+  if (!results.length && !mine.length) {
+    if (apiError) {
+      note = `Nothing in the offline catalogue for that, and AniList could not be reached (${apiError}).`;
+    } else if (index) {
+      note = 'No match in the offline catalogue or on AniList. Try a different spelling, or paste the title into the box below and confirm it by hand.';
+    } else {
+      // The pre-catalogue message, kept for a build with no catalogue file. AniList's index needs
+      // most of a word: "frie" and "frier" return nothing while "friere" returns Frieren.
+      note = 'AniList found nothing for that yet — its search needs most of a word. Try another letter or two.';
+    }
+  }
+  return { q, results, mine, note, source, apiError };
+}
+
+module.exports = {
+  FORMAT_VERSION, MAGIC, COLUMNS, KIND_ANIME, KIND_MANGA, ENOUGH_LOCAL,
+  normalise, sameTitle, usefulSynonyms, serialise, parse, search, toSuggestion,
+  coverUrl, coverFile, haystack, tierOf, libraryMatches, fromMedia, suggest,
+  TIERS: { EXACT, TITLE_PREFIX, WORD_PREFIX, ANYWHERE },
+};
+};
+
+// ---- web-src/catalogue-web.js ------------------------------------------------
+__modules["catalogue-web"] = function (module, exports, require) {
+'use strict';
+
+// Getting the offline title index into the page, and keeping it there.
+//
+// The desktop build reads data/catalogue.tsv off disk in one line. A hosted page has to download
+// it, and it is the largest thing the site serves, so this file is about not paying for it twice.
+//
+// THREE RULES, and each one is a decision rather than a detail:
+//
+// 1. get() is SYNCHRONOUS and may return null. A keystroke must never wait on a download. The
+//    first search on a cold browser gets null, falls through to AniList, and answers normally;
+//    by the next keystroke the index is usually in memory. Blocking instead would make the very
+//    first search the slowest one, which is the opposite of the point.
+//
+// 2. Its own database, not the library's. This is public, refetchable data. The library is the
+//    user's irreplaceable data. Putting them in one IndexedDB means a transaction that touches
+//    the catalogue can queue behind, or interleave with, one that touches the library — and a
+//    corrupt catalogue would then need surgery on the database holding their entries instead of
+//    a delete. Separate databases make that whole class of accident unreachable.
+//
+// 3. Nothing here throws. Storage blocked, quota exceeded, offline, a 404 because the deploy did
+//    not include the file: every one of them ends with the index staying null and search falling
+//    back to AniList, which is exactly how the app behaved before the catalogue existed.
+
+const catalogue = require('../lib/catalogue');
+
+// Served next to index.html and app.js. Relative, not absolute, because the site lives under a
+// project path (/nimeflow/) and a leading slash would ask the domain root for it.
+const FILE = 'catalogue.tsv';
+
+const DB_NAME = 'nimeflow-catalogue';
+const STORE = 'kv';
+const KEY = 'tsv';
+
+let index = null;          // the parsed catalogue, or null
+let started = false;       // has loading been kicked off this page load
+let state = 'idle';        // idle | loading | ready | absent | blocked
+let detail = null;         // why, when state is absent or blocked
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    if (typeof indexedDB === 'undefined' || !indexedDB) {
+      reject(new Error('this browser has no IndexedDB'));
+      return;
+    }
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('the browser refused to open a database'));
+  });
+}
+
+function idbGet(db, key) {
+  return new Promise((resolve) => {
+    try {
+      const req = db.transaction(STORE, 'readonly').objectStore(STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(undefined);
+    } catch { resolve(undefined); }
+  });
+}
+
+function idbPut(db, key, value) {
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(value, key);
+      tx.oncomplete = () => resolve(true);
+      // Quota is the realistic failure and it is not worth reporting: the catalogue still works
+      // this session, it just gets downloaded again next time.
+      tx.onerror = () => resolve(false);
+      tx.onabort = () => resolve(false);
+    } catch { resolve(false); }
+  });
+}
+
+// The header line identifies a build of the catalogue. Comparing it is how a refresh knows whether
+// the download it just made is actually different from what is already cached, without parsing
+// half a megabyte to find out.
+function headerOf(text) {
+  const nl = String(text || '').indexOf('\n');
+  return nl < 0 ? String(text || '') : String(text).slice(0, nl);
+}
+
+// The header of whatever the live index was parsed from, kept so a refresh can tell "same build"
+// from "new build" without holding a second copy of half a megabyte in memory.
+let sourceHeader = '';
+
+function adopt(text, from) {
+  try {
+    index = catalogue.parse(text);
+    sourceHeader = headerOf(text);
+    state = 'ready';
+    detail = null;
+    return true;
+  } catch (err) {
+    // A file that will not parse is worse than none, because it would answer searches wrongly.
+    detail = `${from}: ${err.message}`;
+    return false;
+  }
+}
+
+async function download() {
+  const res = await fetch(FILE, { credentials: 'omit' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const text = await res.text();
+  if (!text || text.indexOf(catalogue.MAGIC) !== 0) {
+    // A single-page host that rewrites unknown paths to index.html answers 200 with HTML. Without
+    // this check that HTML would be parsed as a catalogue and silently produce nothing.
+    throw new Error('the server answered with something that is not a catalogue');
+  }
+  return text;
+}
+
+async function load() {
+  state = 'loading';
+  let db = null;
+  try { db = await openDB(); } catch (err) { detail = err.message; }
+
+  // Cached copy first, so a repeat visit has a working index without touching the network.
+  if (db) {
+    const cached = await idbGet(db, KEY);
+    if (cached) adopt(cached, 'cache');
+  }
+
+  let fresh = null;
+  try {
+    fresh = await download();
+  } catch (err) {
+    if (!index) { state = 'absent'; detail = err.message; }
+    return;
+  }
+
+  // Only re-parse and re-store when the build actually changed. On the common path this is a
+  // string comparison and nothing else.
+  if (!index || headerOf(fresh) !== sourceHeader) {
+    adopt(fresh, 'download');
+    if (db) await idbPut(db, KEY, fresh);
+  }
+  if (!index) { state = 'absent'; }
+}
+
+function start() {
+  if (started) return;
+  started = true;
+  // Deliberately not awaited anywhere. A rejected promise here must not become an unhandled
+  // rejection, so load() catches its own failures and this catch is the backstop.
+  load().catch((err) => { state = 'absent'; detail = err && err.message; });
+}
+
+// The catalogue if it is ready, null if it is not, and never a wait.
+function get() {
+  if (!started) start();
+  return index;
+}
+
+// For the UI and for tests: what happened, in words a person can act on.
+function status() {
+  return {
+    state,
+    detail,
+    titles: index ? index.rows.length : 0,
+    builtAt: index ? index.builtAt : null,
+  };
+}
+
+module.exports = { get, status, start, FILE, DB_NAME };
 };
 
 // ---- lib/chapters.js ---------------------------------------------------------
@@ -1129,7 +1702,11 @@ function scoreCandidate(pool, meta, profile) {
 
 // Build the list for one medium. `pool` is the merged recommendation output; `anchorTitles`
 // maps anilistId -> title so each pick can say which of his favourites pointed at it.
-function build({ db, pool, profile, anchorTitles, mediaType, limit }) {
+// `showBlocked` is the "show me what the filters removed" checkbox. It used to reach /api/discover
+// only, so ticking it changed the shelves and silently did nothing to this list, which sits ABOVE
+// them on the same tab. A control that works on one of two lists on one screen is worse than one
+// that works on neither, because the user concludes nothing was removed.
+function build({ db, pool, profile, anchorTitles, mediaType, limit, showBlocked = false }) {
   const related = new Set(db.entries.map((e) => e.meta.anilistId));
   for (const e of db.entries) for (const r of e.meta.relations || []) related.add(r.id);
   const dismissed = new Set(db.dismissed || []);
@@ -1148,7 +1725,10 @@ function build({ db, pool, profile, anchorTitles, mediaType, limit }) {
     }
     const meta = store.fromAniList(m);
     const filters = taste.applyFilters(meta, db.settings.filters);
-    if (filters.blocked) { blockedByAge++; continue; }
+    if (filters.blocked) {
+      blockedByAge++;
+      if (!showBlocked) continue;
+    }
 
     const s = scoreCandidate(p, meta, profile);
     out.push({
@@ -1167,11 +1747,29 @@ function build({ db, pool, profile, anchorTitles, mediaType, limit }) {
       because: (p.anchorIds || []).map((id) => anchorTitles.get(id)).filter(Boolean).slice(0, 4),
       needsJudgement: filters.needsJudgement,
       audioFlag: filters.audio.verdict === 'FLAG',
+      // Same shape /api/discover reports, so the page renders one explanation for both lists.
+      blocked: filters.blocked,
+      blockedReason: filters.blocked ? filters.age.reason : null,
     });
   }
 
   out.sort((a, b) => b.score - a.score);
-  return { results: out.slice(0, limit), blockedByAge, sameFranchise, poolSize: out.length };
+
+  // Blocked rows are appended BEYOND the limit rather than competing for it, and the two halves
+  // are cut separately. Sorting them last inside one limit looked right and did nothing: with 15
+  // allowed picks available and a limit of 15, every blocked row fell off the end, so ticking
+  // "show what the filters removed" still showed nothing. That is the same defect as the one this
+  // is fixing, one layer down.
+  //
+  // They still go last, because a row the user's own filter rejected must never read as a
+  // recommendation. It is there to be audited.
+  const allowed = out.filter((r) => !r.blocked);
+  const blocked = out.filter((r) => r.blocked);
+  const results = showBlocked
+    ? [...allowed.slice(0, limit), ...blocked.slice(0, limit)]
+    : allowed.slice(0, limit);
+
+  return { results, blockedByAge, sameFranchise, poolSize: allowed.length };
 }
 
 module.exports = { build, scoreCandidate };
@@ -1455,7 +2053,27 @@ function via() { return BASE === DEFAULT_BASE ? '' : ` via ${BASE}`; }
 
 let lastCall = 0;
 
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+// The clock is a SEAM, in the same shape as setBaseUrl above and for the same reason: the thing
+// that has to change under test is the environment, not the logic.
+//
+// Every wait below is real, and hard constraint 8 says it stays real: persisting through MangaDex's
+// 429s triggers an IP ban of undocumented length, so the throttle and the retry ladder are not
+// performance tuning. But a TEST that never opens a socket is not rate limiting anything, and it
+// was paying 15 seconds of a 25-second suite to sleep between fixtures. That is the difference
+// between a suite you can put in a pre-commit hook and one you cannot.
+//
+// The default IS today's behaviour, byte for byte. Only a test replaces it, and only for itself.
+let sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function sleep(ms) { return sleepImpl(ms); }
+
+// Install a different clock. Called with no argument, it restores the real one, so a test cannot
+// leave a no-op sleep behind for whatever runs next in the same process.
+function setTimers(timers) {
+  sleepImpl = (timers && typeof timers.sleep === 'function')
+    ? timers.sleep
+    : (ms) => new Promise((r) => setTimeout(r, ms));
+}
 
 async function api(path, attempt = 0) {
   if (!BASE) {
@@ -1647,7 +2265,7 @@ async function lastRelease(mangaId, lang = 'en') {
 
 module.exports = {
   findManga, latestChapter, mangaRecord, hostedChapters, lastRelease, allTitles, normalise,
-  setBaseUrl, getBaseUrl, isConfigured, DEFAULT_BASE,
+  setBaseUrl, getBaseUrl, isConfigured, DEFAULT_BASE, setTimers,
 };
 };
 
@@ -1816,7 +2434,7 @@ __modules["progression"] = function (module, exports, require) {
 //
 // Term frequencies derived from his own 36 top-and-bottom synopses were pure noise at that
 // sample size, so this lexicon is written from the genre's conventions and then VALIDATED
-// against his ranking. See tools/test-progression.js — it must beat tag-affinity at
+// against his ranking. See tools/report-progression.js — it must beat tag-affinity at
 // separating his top titles from his bottom ones, or it does not ship.
 
 // A visible, mechanical advancement structure. This is the half that actually distinguishes
@@ -2284,6 +2902,8 @@ const { extent } = require('../lib/extent');
 const mangadex = require('../lib/mangadex');
 const { parseBlock } = require('../lib/parse');
 const linking = require('../lib/linking');
+const catalogue = require('../lib/catalogue');
+const catalogueWeb = require('./catalogue-web');
 
 // title -> {chapters,status,matched} or null for a known miss. Page-lifetime only: a reload
 // re-checks, which is the right cadence for a number that changes when a series does.
@@ -2444,53 +3064,25 @@ const routes = {
     return { counts };
   },
 
-  // Paste a freeform list, get back parsed lines each with AniList candidates to confirm.
-  // Nothing is written here — confirmation is a separate, explicit step.
-  // Type-ahead for the Add box. See server.js for the same handler and the reasoning.
+  // Type-ahead for the Add box. The whole decision lives in lib/catalogue.js so this build and the
+  // desktop one cannot answer the same keystroke differently; all that differs is where the index
+  // comes from (a fetch here, a file there).
+  //
+  // catalogueWeb.get() never waits. On the first keystroke of a cold browser it returns null while
+  // the download runs, this falls through to AniList, and the search answers normally.
   'GET /api/suggest': async ({ query }) => {
-    const q = String(query.get('q') || '').trim();
     const db = store.load();
-    const owned = new Set(db.entries.map((e) => e.id));
-
-    // The user's OWN library first, matched locally and instantly. It is the answer to the most
-    // common reason a search finds nothing useful — they already have it — and it costs no
-    // request, so it shows while AniList is still thinking.
-    const mine = q.length >= 2 ? db.entries
-      .filter((e) => e.meta.display.toLowerCase().includes(q.toLowerCase()))
-      .slice(0, 4)
-      .map((e) => ({
-        id: e.id, anilistId: e.meta.anilistId, medium: e.medium,
-        title: e.meta.display, cover: e.meta.cover, year: e.meta.seasonYear,
-        format: e.meta.format, country: e.meta.countryOfOrigin,
-        releaseStatus: e.meta.releaseStatus, totalUnits: e.meta.totalUnits,
-        averageScore: e.meta.averageScore, alreadyHave: true, mine: true,
-      })) : [];
-
-    if (q.length < 2) return { q, results: [], mine, note: null };
-
-    const media = await anilist.suggest(q);
-    const results = media.map((m) => {
-      const meta = store.fromAniList(m);
-      const medium = m.type === 'MANGA' ? (m.format === 'NOVEL' ? 'NOVEL' : 'MANGA') : 'ANIME';
-      return {
-        id: `${medium.toLowerCase()}-${m.id}`,
-        anilistId: m.id, medium,
-        title: meta.display, cover: meta.cover, year: meta.seasonYear,
-        format: meta.format, country: meta.countryOfOrigin,
-        releaseStatus: meta.releaseStatus, totalUnits: meta.totalUnits,
-        averageScore: meta.averageScore,
-        alreadyHave: owned.has(`${medium.toLowerCase()}-${m.id}`),
-      };
-    }).filter((r) => !mine.some((m) => m.id === r.id));
-
-    // AniList's own index is poor at partial words, measured 2026-08-02: "frie" and "frier"
-    // return nothing while "friere" returns Frieren, on both SEARCH_MATCH and POPULARITY_DESC.
-    // An empty dropdown reads as "this title does not exist", so the reason is said out loud.
-    const note = results.length || mine.length ? null
-      : 'AniList found nothing for that yet — its search needs most of a word. Try another letter or two.';
-    return { q, results, mine, note, rate: anilist.rateInfo() };
+    const out = await catalogue.suggest({
+      term: query.get('q') || '',
+      entries: db.entries,
+      index: catalogueWeb.get(),
+      fetchApi: (q) => anilist.suggest(q),
+    });
+    return { ...out, rate: anilist.rateInfo(), catalogue: catalogueWeb.status() };
   },
 
+  // Paste a freeform list, get back parsed lines each with AniList candidates to confirm.
+  // Nothing is written here — confirmation is a separate, explicit step.
   'POST /api/parse': async ({ body }) => {
     const { text } = body;
     const parsed = parseBlock(text);
@@ -2521,7 +3113,11 @@ const routes = {
       // hands three plausible candidates to a line that matched nothing on its own. Flagged so
       // the confirm step can say where the match came from.
       const viaShortened = (hits.__fallback || []).includes(`k${i}`);
-      return { ...p, candidates, viaShortened, chosen: candidates.length ? 0 : null };
+      // AniList ERRORED on this line rather than having nothing for it. Saying "no match" for a
+      // server-side failure tells the user their title does not exist, which is a different
+      // thing and sends them off to check a spelling that was fine.
+      const lookupFailed = (hits.__errored || []).includes(`k${i}`);
+      return { ...p, candidates, viaShortened, lookupFailed, chosen: candidates.length ? 0 : null };
     });
 
     return { items, rate: anilist.rateInfo() };
@@ -2544,7 +3140,11 @@ const routes = {
       const m = byId.get(it.anilistId);
       if (!m) continue;
       const meta = store.fromAniList(m);
-      const medium = it.medium || (m.type === 'MANGA' ? 'MANGA' : 'ANIME');
+      // The format matters, not just the type: every other place in this codebase derives a
+      // NOVEL from it, and filing a light novel as MANGA sends it down the chapter-tracking
+      // path and shows the wrong unit word. The UI always sends a medium, so this fallback is
+      // for any other caller, which is exactly where a quiet inconsistency survives.
+      const medium = it.medium || (m.type === 'MANGA' ? (m.format === 'NOVEL' ? 'NOVEL' : 'MANGA') : 'ANIME');
       const entry = store.makeEntry({
         medium, meta,
         status: it.status || 'CAUGHT_UP',
@@ -2828,6 +3428,8 @@ const routes = {
     const profile = taste.tasteProfile(db);
     const nAnime = Number(query.get('anime') || 15);
     const nManga = Number(query.get('manga') || 5);
+    // Same control the shelves below already honour. See lib/foryou.js for why it must reach both.
+    const showBlocked = query.get('showBlocked') === '1';
 
     // Anchors: his top-ranked titles per medium, franchise-deduped, nostalgia excluded.
     const pickAnchors = (medium, max) => {
@@ -2859,8 +3461,8 @@ const routes = {
     const anchorTitles = new Map(allAnchors.map((a) => [a.entry.meta.anilistId, a.entry.meta.display]));
     const pool = await anilist.recommendationsFrom(allAnchors.map((a) => a.entry.meta.anilistId), 14);
 
-    const anime = foryou.build({ db, pool, profile, anchorTitles, mediaType: 'ANIME', limit: nAnime });
-    const manga = foryou.build({ db, pool, profile, anchorTitles, mediaType: 'MANGA', limit: nManga });
+    const anime = foryou.build({ db, pool, profile, anchorTitles, mediaType: 'ANIME', limit: nAnime, showBlocked });
+    const manga = foryou.build({ db, pool, profile, anchorTitles, mediaType: 'MANGA', limit: nManga, showBlocked });
 
     return {
       anime: anime.results,
@@ -3626,9 +4228,32 @@ function persistBackups() {
   return done;
 }
 
+// The sync anchor is merged FIELD BY FIELD against what is stored, not overwritten wholesale.
+//
+// It used to write `{ ...sync }`, which is this tab's whole view of the world. Two tabs then
+// clobber each other's anchor: the one that writes second erases a newer lastSyncedAt, or clears a
+// pendingPush the other tab set because it has an unpushed edit. That second case is the one worth
+// the code, because a dropped pendingPush means an offline write silently never reaches the server.
+//
+// This is the same class as the library race fixed on 2026-08-01 and it is deliberately treated as
+// much smaller: the decision below is per field and needs no generation counter, because the cost
+// of getting it wrong is a redundant sync rather than a lost library. idbUpdate runs the callback
+// INSIDE the readwrite transaction, so `stored` is what is really there at the moment of writing.
 function persistSync() {
   persistChain = persistChain
-    .then(() => idbUpdate(KEY_SYNC, () => ({ ...sync })))
+    .then(() => idbUpdate(KEY_SYNC, (stored) => {
+      const s = stored && typeof stored === 'object' ? stored : {};
+      return {
+        // The later timestamp wins whichever tab produced it. A sync that happened, happened.
+        lastSyncedAt: [sync.lastSyncedAt, s.lastSyncedAt].filter(Boolean).sort().pop() || null,
+        // Sticky: if EITHER tab still owes the server a push, the answer is yes. Clearing this
+        // wrongly loses an edit; setting it wrongly costs one needless upload.
+        pendingPush: !!sync.pendingPush || !!s.pendingPush,
+        // This tab's account is the current one. A different stored id means the other tab signed
+        // in as somebody else, and whoever wrote last is who the browser is now.
+        syncedUserId: sync.syncedUserId !== undefined ? sync.syncedUserId : (s.syncedUserId || null),
+      };
+    }))
     .then(() => {}, (err) => { reportPersist(err); });
 }
 
@@ -5318,6 +5943,6 @@ module.exports = { ageVerdict, audioVerdict, applyFilters, owed, tasteProfile, s
 var __app = __require("api-browser");
 // What this build actually contains. It is the one thing a deployed page cannot otherwise be
 // asked, and it is what the build's own check asserts against.
-__app.modules = ["adaptations","anilist","api-browser","axes","chapters","config","extent","fit","foryou","franchise","linking","mangadex","parse","progression","rank","routes","store-core","store-web","supabase","taste"];
+__app.modules = ["adaptations","anilist","api-browser","axes","catalogue","catalogue-web","chapters","config","extent","fit","foryou","franchise","linking","mangadex","parse","progression","rank","routes","store-core","store-web","supabase","taste"];
 window.NimeFlow = __app;
 })();

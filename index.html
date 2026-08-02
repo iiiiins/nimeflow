@@ -440,6 +440,22 @@ function renderLibrary() {
       const sc = el('input'); sc.type='number'; sc.min='0'; sc.max='100'; sc.placeholder='—'; sc.value = e.score ?? '';
       sc.onchange = () => patch(e.id, { score: sc.value === '' ? null : Number(sc.value) });
       tdSc.append(sc);
+      // A typed score DETACHES this title from the ranking: lib/rank.js skips anything marked
+      // manual, on the deliberate rule that an explicit rating outranks an inferred one. Nothing
+      // said so, so a number typed here quietly stopped tracking the instrument that produces
+      // every other number in this column, and the only way back was not obvious either.
+      //
+      // Both facts are now on screen. Clearing the box already restores pairwise scoring
+      // (store-core resets scoreSource to null when score is cleared); it just never said so.
+      if (e.scoreSource === 'manual') {
+        sc.style.borderColor = 'var(--accent)';
+        sc.title = 'Typed by you. This title no longer moves with your ranking. Clear the box to hand it back.';
+        const hint = el('div','muted','yours · clear to re-rank');
+        hint.style.cssText = 'font-size:11px;white-space:nowrap';
+        tdSc.append(hint);
+      } else {
+        sc.title = 'Ranking sets this from your pairwise comparisons. Typing a number here takes this title out of that and keeps whatever you type.';
+      }
     }
     tr.append(tdSc);
 
@@ -841,7 +857,12 @@ function renderParsed() {
     pick.append(el('div','meta', item.raw));
 
     if (!item.candidates.length) {
-      pick.append(el('div','flag','no match on AniList — skipped'));
+      // A failed lookup and an absent title look identical from here unless the route says which.
+      // Telling somebody their show does not exist when AniList simply errored sends them to
+      // re-check a spelling that was correct.
+      pick.append(el('div','flag', item.lookupFailed
+        ? 'AniList returned an error for this line, so it was not looked up. Try again in a moment.'
+        : 'no match on AniList — skipped'));
       item.chosen = null;
     } else {
       const sel = el('select'); sel.style.marginTop='6px'; sel.style.maxWidth='100%';
@@ -1040,7 +1061,7 @@ $('#forYouBtn').onclick = async () => {
   try {
     await api('/api/settings', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ filters: { childCastCredibility: $('#fAge').checked, requireNonChineseAudio: $('#fCn').checked } }) });
-    const r = await api('/api/foryou?anime=15&manga=5');
+    const r = await api('/api/foryou?anime=15&manga=5&showBlocked=' + ($('#fShowBlocked').checked ? '1' : '0'));
     renderForYou(r);
     // The server answers `{anime:[],manga:[],note:...}` when nothing is ranked yet — no
     // anchors key, no stats key. Reading them threw, and the user saw the raw text "failed:
@@ -1085,7 +1106,7 @@ function renderForYou(r) {
   more.style.marginTop = '14px';
   more.onclick = async () => {
     more.disabled = true; more.textContent = 'loading…';
-    try { renderForYou(await api('/api/foryou?anime=15&manga=30')); }
+    try { renderForYou(await api('/api/foryou?anime=15&manga=30&showBlocked=' + ($('#fShowBlocked').checked ? '1' : '0'))); }
     catch (e) { more.disabled = false; more.textContent = 'failed — retry'; }
   };
   // Offering "show 30 instead of 0" on an empty list is noise; there is nothing to deepen yet.
@@ -1155,13 +1176,22 @@ function forYouCard(c) {
   }
 
   const marks = el('div'); marks.style.marginTop='6px';
+  // Corroboration stays coloured, because it IS reader-relative: it counts this reader's own
+  // favourites. The rest describe the title and are neutral, for the reason in the Discover card
+  // below: a dial has two ends and only one person sits at the end these colours assumed.
   marks.append(el('span','tag good', c.anchors === 1 ? '1 favourite points here' : `${c.anchors} favourites point here`));
-  if (c.progression >= 3) marks.append(el('span','tag good','strong progression language'));
+  if (c.progression >= 3) marks.append(el('span','tag','strong progression language'));
   else if (c.hasSystem) marks.append(el('span','tag','progression system'));
-  if (c.isOverpowered) marks.append(el('span','tag good','overpowered lead'));
+  if (c.isOverpowered) marks.append(el('span','tag','overpowered lead'));
+  // These two stay warnings: they are not taste, they are the reader's OWN filter settings
+  // reporting what they asked to be told about.
   if (c.needsJudgement) marks.append(el('span','tag warn','young cast — worth a look first'));
   if (c.audioFlag) marks.append(el('span','tag warn','Chinese-origin, needs a dub'));
+  if (c.blocked) marks.append(el('span','tag warn','your filters would hide this'));
   mid.append(marks);
+  // Shown only when "show what the filters removed" is ticked, and the row is sorted below every
+  // allowed one. It is here to explain what the filter did, not to be recommended.
+  if (c.blocked) mid.append(el('div','flag','blocked — ' + (c.blockedReason || 'filtered')));
 
   if (c.because.length) mid.append(el('div','why', 'because you rate: ' + c.because.join(', ')));
 
@@ -1280,8 +1310,16 @@ function discCard(c, max) {
     if (marks.length) {
       const m = el('div');
       m.style.marginTop = '6px';
-      const bad = new Set(['lead gets put through it', 'lead may be carried']);
-      for (const t of marks) m.append(el('span', 'tag ' + (bad.has(t) ? 'warn' : 'good'), t));
+      // NEUTRAL, since 2026-08-02. These describe the TITLE; they are not a verdict on whether it
+      // suits the reader. "lead gets put through it" was painted as a warning and "overpowered
+      // lead" as good news, which is one person's dial preferences rendered as universal facts.
+      // An Attack on Titan fan is the same dial with the sign flipped, and the app now goes to
+      // people who are not him.
+      //
+      // The reader-relative number has not gone anywhere: it is the % match and the agreement
+      // count, both computed from that reader's own comparisons. Colouring a description as well
+      // was asserting the same judgement twice, and getting it wrong for half the audience.
+      for (const t of marks) m.append(el('span', 'tag', t));
       mid.append(m);
     }
     if (c.punished && c.punished.length) mid.append(el('div','why','punishing elements: ' + c.punished.join(', ')));

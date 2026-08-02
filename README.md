@@ -20,9 +20,10 @@ That means:
   thing as a file. That file is yours and it imports back into any copy of this app.
 - **You can have it deleted.** Ask me and it goes.
 
-That is the trade for having one list across your devices. If you would rather nothing left your
-machine at all, ask me for the folder version instead: it runs on your own computer, keeps
-everything in a file next to itself, and needs no account.
+That is the trade for having one list across your devices. If you would rather your list stayed on
+your own machine, ask me for the folder version instead: it runs on your computer, keeps your list
+in a file next to itself, and needs no account. Either way, looking a title up asks AniList about
+it and checking chapters asks MangaDex, because that is where the catalogue lives.
 
 **Until you sign in**, your list lives only in the browser you are using. That is real storage,
 but a browser can forget it: clearing site data does it in one click, and a private window never
